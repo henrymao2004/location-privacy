@@ -1,8 +1,99 @@
 import tensorflow as tf
-from keras.losses import binary_crossentropy
+from keras.losses import binary_crossentropy, Loss
 import keras
 from keras.layers import Layer
 import numpy as np
+
+# Custom Keras Loss class for trajectory loss
+class CustomTrajLoss(Loss):
+    def __init__(self, p_bce=1, p_latlon=10, p_cat=1, p_day=1, p_hour=1, **kwargs):
+        super().__init__(**kwargs)
+        self.p_bce = p_bce
+        self.p_latlon = p_latlon
+        self.p_cat = p_cat
+        self.p_day = p_day
+        self.p_hour = p_hour
+        
+        # Store references to the model's input and output tensors
+        self.real_traj = None
+        self.gen_traj = None
+        
+    def set_trajectories(self, real_traj, gen_traj):
+        """Set the real and generated trajectories for loss computation."""
+        # Ensure all tensors have consistent data type (float32)
+        self.real_traj = [
+            tf.cast(real_traj[0], tf.float32),  # lat_lon
+            tf.cast(real_traj[1], tf.float32),  # category
+            tf.cast(real_traj[2], tf.float32),  # day
+            tf.cast(real_traj[3], tf.float32),  # hour
+            tf.cast(real_traj[4], tf.float32),  # mask
+        ]
+        
+        self.gen_traj = [
+            tf.cast(gen_traj[0], tf.float32),  # lat_lon
+            tf.cast(gen_traj[1], tf.float32),  # category
+            tf.cast(gen_traj[2], tf.float32),  # day
+            tf.cast(gen_traj[3], tf.float32),  # hour
+            tf.cast(gen_traj[4], tf.float32),  # mask
+        ]
+        
+    def call(self, y_true, y_pred):
+        """Compute the loss value.
+        
+        Args:
+            y_true: Ground truth values.
+            y_pred: Predictions from the discriminator.
+            
+        Returns:
+            Loss value.
+        """
+        # Cast inputs to float32 for consistent typing
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        
+        # Simple BCE loss if trajectories are not available
+        if self.real_traj is None or self.gen_traj is None:
+            return binary_crossentropy(y_true, y_pred)
+            
+        # Binary cross-entropy for adversarial loss
+        bce_loss = binary_crossentropy(y_true, y_pred)
+        
+        # Get trajectory length from mask
+        traj_length = keras.ops.sum(self.real_traj[4], axis=1)
+        traj_length = keras.ops.expand_dims(traj_length, axis=1)  # Add dimension for broadcasting
+        
+        # Compute MSE for lat/lon (spatial loss)
+        diff = self.gen_traj[0] - self.real_traj[0]
+        squared_diff = diff * diff
+        mask_repeated = keras.ops.repeat(self.real_traj[4], 2, axis=2)
+        masked_squared_diff = squared_diff * mask_repeated
+        masked_latlon_full = keras.ops.sum(keras.ops.sum(masked_squared_diff, axis=1), axis=1, keepdims=True)
+        masked_latlon_mse = keras.ops.sum(masked_latlon_full / traj_length)
+        
+        # Cross entropy for categories
+        ce_category = keras.ops.categorical_crossentropy(self.real_traj[1], self.gen_traj[1], from_logits=False)
+        ce_day = keras.ops.categorical_crossentropy(self.real_traj[2], self.gen_traj[2], from_logits=False)
+        ce_hour = keras.ops.categorical_crossentropy(self.real_traj[3], self.gen_traj[3], from_logits=False)
+        
+        # Apply masks
+        mask_sum = keras.ops.sum(self.real_traj[4], axis=2)
+        ce_category_masked = ce_category * mask_sum
+        ce_day_masked = ce_day * mask_sum
+        ce_hour_masked = ce_hour * mask_sum
+        
+        # Compute mean
+        ce_category_mean = keras.ops.sum(ce_category_masked / traj_length)
+        ce_day_mean = keras.ops.sum(ce_day_masked / traj_length)
+        ce_hour_mean = keras.ops.sum(ce_hour_masked / traj_length)
+        
+        # Combined loss
+        total_loss = (bce_loss * self.p_bce + 
+                      masked_latlon_mse * self.p_latlon + 
+                      ce_category_mean * self.p_cat + 
+                      ce_day_mean * self.p_day + 
+                      ce_hour_mean * self.p_hour)
+        
+        return total_loss
 
 # BCE loss for the discriminator
 def d_bce_loss(mask):
@@ -85,16 +176,31 @@ def compute_advantage(rewards, values, gamma=0.99, gae_lambda=0.95):
         advantages: Tensor of shape [batch_size, 1] containing advantages
     """
     # Ultra simplified version to avoid shape issues
-    # Just use rewards as advantages for now
+    # First, check the shape of rewards to handle unexpected dimensions
     rewards_tensor = tf.cast(rewards, tf.float32)
+    rewards_shape = tf.shape(rewards_tensor)
+    batch_size = rewards_shape[0]
+    
+    # If rewards has more than 2 dimensions or is not [batch_size, 1],
+    # reduce it by taking the mean across all dimensions except the first
+    if len(rewards_tensor.shape) > 2 or (len(rewards_tensor.shape) == 2 and rewards_tensor.shape[1] > 1):
+        print(f"Reshaping rewards from {rewards_tensor.shape} to [{batch_size}, 1] by taking mean")
+        # Flatten all dimensions after the first and then take the mean
+        flat_rewards = tf.reshape(rewards_tensor, [batch_size, -1])
+        rewards_tensor = tf.reduce_mean(flat_rewards, axis=1, keepdims=True)
+    else:
+        # Just ensure it has shape [batch_size, 1]
+        rewards_tensor = tf.reshape(rewards_tensor, [batch_size, 1])
     
     # Basic normalization
     mean = tf.reduce_mean(rewards_tensor)
     std = tf.math.reduce_std(rewards_tensor) + 1e-8
     normalized_advantages = (rewards_tensor - mean) / std
     
-    # Make sure we return the right shape
-    return tf.reshape(normalized_advantages, [-1, 1])
+    # Make sure output shape is correct: [batch_size, 1]
+    normalized_advantages = tf.reshape(normalized_advantages, [batch_size, 1])
+    
+    return normalized_advantages
 
 def compute_returns(rewards, gamma=0.99):
     """Compute discounted returns (sum of future rewards).
@@ -107,11 +213,23 @@ def compute_returns(rewards, gamma=0.99):
         returns: Tensor of shape [batch_size, 1] containing returns
     """
     # Ultra simplified version to avoid shape issues
-    # Just use rewards as returns for now
+    # First, check the shape of rewards to handle unexpected dimensions
     rewards_tensor = tf.cast(rewards, tf.float32)
+    rewards_shape = tf.shape(rewards_tensor)
+    batch_size = rewards_shape[0]
     
-    # Make sure we return the right shape
-    return tf.reshape(rewards_tensor, [-1, 1])
+    # If rewards has more than 2 dimensions or is not [batch_size, 1],
+    # reduce it by taking the mean across all dimensions except the first
+    if len(rewards_tensor.shape) > 2 or (len(rewards_tensor.shape) == 2 and rewards_tensor.shape[1] > 1):
+        print(f"Reshaping rewards from {rewards_tensor.shape} to [{batch_size}, 1] by taking mean")
+        # Flatten all dimensions after the first and then take the mean
+        flat_rewards = tf.reshape(rewards_tensor, [batch_size, -1])
+        rewards_tensor = tf.reduce_mean(flat_rewards, axis=1, keepdims=True)
+    else:
+        # Just ensure it has shape [batch_size, 1]
+        rewards_tensor = tf.reshape(rewards_tensor, [batch_size, 1])
+    
+    return rewards_tensor
 
 def compute_entropy_loss(action_probs):
     """Compute entropy loss to encourage exploration.

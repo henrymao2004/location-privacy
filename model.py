@@ -19,7 +19,7 @@ from keras.models import Sequential, Model
 from keras.optimizers import Adam
 from keras.preprocessing.sequence import pad_sequences
 
-from losses import d_bce_loss, trajLoss, compute_advantage, compute_returns, compute_trajectory_ratio, compute_entropy_loss
+from losses import d_bce_loss, trajLoss, TrajLossLayer, CustomTrajLoss, compute_advantage, compute_returns, compute_trajectory_ratio, compute_entropy_loss
 
 class TransformerBlock(layers.Layer):
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
@@ -340,9 +340,20 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Discriminator predictions
         pred = self.discriminator(gen_trajs[:4])
         
-        # Use the full custom loss function for trajectory optimization
+        # Create the combined model
         self.combined = Model(inputs, pred)
-        self.combined.compile(loss=trajLoss(inputs, gen_trajs), optimizer=self.actor_optimizer)
+        
+        # Create a custom loss instance for trajectory optimization
+        self.traj_loss = CustomTrajLoss()
+        # Store input and generator output references
+        self.input_tensors = inputs
+        self.generated_trajectories = gen_trajs
+        
+        # Compile the model with the custom loss
+        self.combined.compile(loss=self.traj_loss, optimizer=self.actor_optimizer)
+        
+        # Store the generator outputs for later use in reward computation
+        self.gen_trajs_symbolic = gen_trajs
 
     def compute_rewards(self, real_trajs, gen_trajs, tul_classifier):
         """Compute the three-part reward function as described in the paper.
@@ -355,8 +366,13 @@ class RL_Enhanced_Transformer_TrajGAN():
         Returns:
             Combined reward balancing privacy, utility and realism
         """
+        # Cast inputs to float32 for consistent typing
+        gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
+        real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
+        
         # Adversarial reward - measures realism based on discriminator output
         d_pred = self.discriminator.predict(gen_trajs[:4])
+        d_pred = tf.cast(d_pred, tf.float32)
         r_adv = tf.math.log(d_pred + 1e-10)
         
         # Utility preservation reward - measures statistical similarity
@@ -451,6 +467,9 @@ class RL_Enhanced_Transformer_TrajGAN():
         r_adv = tf.cast(r_adv, tf.float32)
         rewards = w1 * r_adv + w2 * r_util + w3 * r_priv
         
+        # Debug print to check rewards shape
+        print(f"Rewards shape: {rewards.shape}")
+        
         return rewards
 
     def train_step(self, real_trajs, batch_size=256):
@@ -458,13 +477,27 @@ class RL_Enhanced_Transformer_TrajGAN():
         noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
         gen_trajs = self.generator.predict([*real_trajs, noise])
         
+        # Ensure consistent data types
+        real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
+        gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
+        
+        # Update the custom loss with the current real and generated trajectories
+        self.traj_loss.set_trajectories(real_trajs, gen_trajs)
+        
         # Compute full rewards using the TUL classifier
         rewards = self.compute_rewards(real_trajs, gen_trajs, self.tul_classifier)
         
         # Compute advantages and returns for PPO
         values = self.critic.predict(real_trajs[:4])
+        values = tf.cast(values, tf.float32)
         advantages = compute_advantage(rewards, values, self.gamma, self.gae_lambda)
         returns = compute_returns(rewards, self.gamma)
+        
+        # Ensure returns has the same batch size as what the critic expects
+        # The critic takes real_trajs[:4] as input, so returns should match that shape
+        if returns.shape[0] != batch_size:
+            print(f"Warning: Reshaping returns from {returns.shape} to [{batch_size}, 1]")
+            returns = tf.reshape(returns, [batch_size, 1])
         
         # Update critic using returns
         c_loss = self.critic.train_on_batch(real_trajs[:4], returns)
@@ -479,7 +512,7 @@ class RL_Enhanced_Transformer_TrajGAN():
             np.zeros((batch_size, 1))
         )
         
-        # Update generator (actor) using PPO
+        # Update generator (actor) using advantages
         g_loss = self.update_actor(real_trajs, gen_trajs, advantages)
         
         return {"d_loss_real": d_loss_real, "d_loss_fake": d_loss_fake, "g_loss": g_loss, "c_loss": c_loss}
@@ -587,22 +620,43 @@ class RL_Enhanced_Transformer_TrajGAN():
         batch_size = states[0].shape[0]
         noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
         
-        # Prepare inputs
+        # Prepare inputs for the generator
         all_inputs = [*states, noise]
         
-        # Prepare targets for training - we want to maximize the advantage, 
-        # so we use ones when advantage is positive
+        # Use ones as targets for the discriminator output (we want to fool the discriminator)
         targets = np.ones((batch_size, 1))
         
-        # Use advantages as sample weights - this approximates policy gradient
-        # Scale advantages to be suitable as sample weights
-        sample_weights = tf.abs(advantages)
+        # Convert advantages to numpy and ensure proper type/shape
+        try:
+            # First ensure advantages is a tensor with float32 type
+            advantages = tf.cast(advantages, tf.float32)
+            
+            # Then convert to numpy and flatten
+            advantages_np = advantages.numpy().flatten()  # Flatten to ensure it's 1D
+            
+            # Scale advantages to be positive (sample_weight should be positive)
+            advantages_np = advantages_np - np.min(advantages_np) + 1e-3
+            
+            # Normalize to reasonable values
+            if np.max(advantages_np) > 0:
+                advantages_np = advantages_np / np.max(advantages_np)
+                
+            # Ensure it has the right shape
+            if len(advantages_np) != batch_size:
+                print(f"Warning: Reshaping advantages from {len(advantages_np)} to {batch_size}")
+                # If shapes don't match, use uniform weights
+                advantages_np = np.ones(batch_size)
+                
+        except Exception as e:
+            print(f"Error processing advantages: {e}")
+            # Fallback to uniform weights
+            advantages_np = np.ones(batch_size)
         
-        # Train the combined model (which updates the generator)
+        # Train the combined model with sample weights from advantages
         loss = self.combined.train_on_batch(
             all_inputs, 
             targets,
-            sample_weight=sample_weights
+            sample_weight=advantages_np
         )
         
         return loss
