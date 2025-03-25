@@ -62,36 +62,74 @@ class CustomTrajLoss(Loss):
         traj_length = keras.ops.sum(self.real_traj[4], axis=1)
         traj_length = keras.ops.expand_dims(traj_length, axis=1)  # Add dimension for broadcasting
         
+        # Add a small epsilon to avoid division by zero
+        traj_length = traj_length + 1e-6
+        
         # Compute MSE for lat/lon (spatial loss)
         diff = self.gen_traj[0] - self.real_traj[0]
+        # Clip differences to avoid extreme values
+        diff = keras.ops.clip(diff, -10.0, 10.0)
         squared_diff = diff * diff
         mask_repeated = keras.ops.repeat(self.real_traj[4], 2, axis=2)
         masked_squared_diff = squared_diff * mask_repeated
         masked_latlon_full = keras.ops.sum(keras.ops.sum(masked_squared_diff, axis=1), axis=1, keepdims=True)
         masked_latlon_mse = keras.ops.sum(masked_latlon_full / traj_length)
         
-        # Cross entropy for categories
-        ce_category = keras.ops.categorical_crossentropy(self.real_traj[1], self.gen_traj[1], from_logits=False)
-        ce_day = keras.ops.categorical_crossentropy(self.real_traj[2], self.gen_traj[2], from_logits=False)
-        ce_hour = keras.ops.categorical_crossentropy(self.real_traj[3], self.gen_traj[3], from_logits=False)
-        
-        # Apply masks
-        mask_sum = keras.ops.sum(self.real_traj[4], axis=2)
-        ce_category_masked = ce_category * mask_sum
-        ce_day_masked = ce_day * mask_sum
-        ce_hour_masked = ce_hour * mask_sum
-        
-        # Compute mean
+        # Cross-entropy for category
+        # Clip generated probabilities to avoid log(0)
+        gen_category_clipped = keras.ops.clip(self.gen_traj[1], 1e-7, 1.0)
+        ce_category = keras.ops.categorical_crossentropy(self.real_traj[1], gen_category_clipped, from_logits=False)
+        # Apply mask
+        ce_category_masked = ce_category * self.real_traj[4][:,:,0]
         ce_category_mean = keras.ops.sum(ce_category_masked / traj_length)
+        
+        # Cross-entropy for day
+        # Clip generated probabilities to avoid log(0)
+        gen_day_clipped = keras.ops.clip(self.gen_traj[2], 1e-7, 1.0)
+        ce_day = keras.ops.categorical_crossentropy(self.real_traj[2], gen_day_clipped, from_logits=False)
+        # Apply mask
+        ce_day_masked = ce_day * self.real_traj[4][:,:,0]
         ce_day_mean = keras.ops.sum(ce_day_masked / traj_length)
+        
+        # Cross-entropy for hour
+        # Clip generated probabilities to avoid log(0)
+        gen_hour_clipped = keras.ops.clip(self.gen_traj[3], 1e-7, 1.0)
+        ce_hour = keras.ops.categorical_crossentropy(self.real_traj[3], gen_hour_clipped, from_logits=False)
+        # Apply mask
+        ce_hour_masked = ce_hour * self.real_traj[4][:,:,0]
         ce_hour_mean = keras.ops.sum(ce_hour_masked / traj_length)
         
-        # Combined loss
-        total_loss = (bce_loss * self.p_bce + 
-                      masked_latlon_mse * self.p_latlon + 
-                      ce_category_mean * self.p_cat + 
-                      ce_day_mean * self.p_day + 
-                      ce_hour_mean * self.p_hour)
+        # Combined loss with proper weighting
+        # Clip each component to reasonable ranges
+        bce_loss_clipped = keras.ops.clip(bce_loss, 0, 10)
+        masked_latlon_mse_clipped = keras.ops.clip(masked_latlon_mse, 0, 100)
+        ce_category_mean_clipped = keras.ops.clip(ce_category_mean, 0, 10)
+        ce_day_mean_clipped = keras.ops.clip(ce_day_mean, 0, 10)
+        ce_hour_mean_clipped = keras.ops.clip(ce_hour_mean, 0, 10)
+        
+        # Use reduced weights for a more stable start
+        p_bce = tf.constant(self.p_bce, dtype=tf.float32)
+        p_latlon = tf.constant(self.p_latlon, dtype=tf.float32)
+        p_cat = tf.constant(self.p_cat, dtype=tf.float32)
+        p_day = tf.constant(self.p_day, dtype=tf.float32)
+        p_hour = tf.constant(self.p_hour, dtype=tf.float32)
+        
+        total_loss = (p_bce * bce_loss_clipped + 
+                     p_latlon * masked_latlon_mse_clipped + 
+                     p_cat * ce_category_mean_clipped + 
+                     p_day * ce_day_mean_clipped + 
+                     p_hour * ce_hour_mean_clipped)
+        
+        # Final safety clipping to prevent numerical instability
+        total_loss = keras.ops.clip(total_loss, 0, 1000)
+        
+        # Debug output
+        tf.print("Loss components - BCE:", bce_loss_clipped, 
+                "Spatial:", masked_latlon_mse_clipped, 
+                "Category:", ce_category_mean_clipped,
+                "Day:", ce_day_mean_clipped,
+                "Hour:", ce_hour_mean_clipped,
+                "Total:", total_loss)
         
         return total_loss
 

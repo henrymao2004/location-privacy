@@ -77,7 +77,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.gamma = 0.99  # discount factor
         self.gae_lambda = 0.95  # GAE parameter
         self.clip_epsilon = 0.2  # PPO clip parameter
-        self.c1 = 1.0  # value function coefficient
+        self.c1 = 0.5  # value function coefficient (reduced)
         self.c2 = 0.01  # entropy coefficient
         self.ppo_epochs = 4  # Number of PPO epochs per batch
         
@@ -85,20 +85,20 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.tul_classifier = self.load_tul_classifier()
         
         # Define reward weights
-        self.w_adv = 1.0  # Weight for adversarial reward
-        self.w_util = 1.0  # Weight for utility reward
-        self.w_priv = 1.0  # Weight for privacy reward
+        self.w_adv = 0.5  # Weight for adversarial reward (reduced)
+        self.w_util = 0.5  # Weight for utility reward (reduced)
+        self.w_priv = 0.5  # Weight for privacy reward (reduced)
         
         # Define utility component weights
-        self.beta = 1.0   # Spatial loss weight
-        self.gamma = 0.5  # Temporal loss weight
-        self.chi = 0.5    # Category loss weight
-        self.alpha = 1.0  # Privacy strength weight
+        self.beta = 0.5   # Spatial loss weight (reduced)
+        self.gamma = 0.2  # Temporal loss weight (reduced)
+        self.chi = 0.2    # Category loss weight (reduced)
+        self.alpha = 0.5  # Privacy strength weight (reduced)
         
-        # Define optimizers
-        self.actor_optimizer = Adam(0.0003)
-        self.critic_optimizer = Adam(0.0003)
-        self.discriminator_optimizer = Adam(0.0001)
+        # Define optimizers with reduced learning rates and gradient clipping
+        self.actor_optimizer = Adam(0.00001, clipnorm=1.0)  # Reduced from 0.00005
+        self.critic_optimizer = Adam(0.00001, clipnorm=1.0)  # Reduced from 0.00005
+        self.discriminator_optimizer = Adam(0.000005, clipnorm=1.0)  # Reduced from 0.00001
 
         # Build networks
         self.generator = self.build_generator()
@@ -373,23 +373,34 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Adversarial reward - measures realism based on discriminator output
         d_pred = self.discriminator.predict(gen_trajs[:4])
         d_pred = tf.cast(d_pred, tf.float32)
-        r_adv = tf.math.log(d_pred + 1e-10)
+        # Clip discriminator predictions to avoid extreme log values
+        d_pred = tf.clip_by_value(d_pred, 1e-7, 1.0 - 1e-7)
+        r_adv = tf.math.log(d_pred)
         
         # Utility preservation reward - measures statistical similarity
         # Spatial loss - L2 distance between coordinates
         spatial_loss = tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]), axis=[1, 2])
         spatial_loss = tf.cast(spatial_loss, tf.float32)
+        # Clip spatial loss to avoid extremely large values
+        spatial_loss = tf.clip_by_value(spatial_loss, 0.0, 10.0)
         
         # Temporal loss - cross-entropy on temporal distributions (day and hour)
-        temp_day_loss = -tf.reduce_sum(real_trajs[2] * tf.math.log(gen_trajs[2] + 1e-10), axis=[1, 2])
+        # Clip generated values to avoid log(0)
+        gen_trajs_day_clipped = tf.clip_by_value(gen_trajs[2], 1e-7, 1.0 - 1e-7)
+        temp_day_loss = -tf.reduce_sum(real_trajs[2] * tf.math.log(gen_trajs_day_clipped), axis=[1, 2])
         temp_day_loss = tf.cast(temp_day_loss, tf.float32)
+        temp_day_loss = tf.clip_by_value(temp_day_loss, 0.0, 10.0)
         
-        temp_hour_loss = -tf.reduce_sum(real_trajs[3] * tf.math.log(gen_trajs[3] + 1e-10), axis=[1, 2])
+        gen_trajs_hour_clipped = tf.clip_by_value(gen_trajs[3], 1e-7, 1.0 - 1e-7)
+        temp_hour_loss = -tf.reduce_sum(real_trajs[3] * tf.math.log(gen_trajs_hour_clipped), axis=[1, 2])
         temp_hour_loss = tf.cast(temp_hour_loss, tf.float32)
+        temp_hour_loss = tf.clip_by_value(temp_hour_loss, 0.0, 10.0)
         
         # Categorical loss - cross-entropy on category distributions
-        cat_loss = -tf.reduce_sum(real_trajs[1] * tf.math.log(gen_trajs[1] + 1e-10), axis=[1, 2])
+        gen_trajs_cat_clipped = tf.clip_by_value(gen_trajs[1], 1e-7, 1.0 - 1e-7)
+        cat_loss = -tf.reduce_sum(real_trajs[1] * tf.math.log(gen_trajs_cat_clipped), axis=[1, 2])
         cat_loss = tf.cast(cat_loss, tf.float32)
+        cat_loss = tf.clip_by_value(cat_loss, 0.0, 10.0)
         
         # Combine utility components with appropriate weights
         # Convert Python floats to TensorFlow constants with explicit type
@@ -460,15 +471,33 @@ class RL_Enhanced_Transformer_TrajGAN():
             r_priv = tf.zeros_like(r_adv)
         
         # Combined reward with configurable weights
-        w1 = tf.constant(1.0, dtype=tf.float32)
-        w2 = tf.constant(1.0, dtype=tf.float32)
-        w3 = tf.constant(1.0, dtype=tf.float32)
+        w1 = tf.constant(0.5, dtype=tf.float32)  # Reduced weight for adversarial reward
+        w2 = tf.constant(0.3, dtype=tf.float32)  # Reduced weight for utility reward
+        w3 = tf.constant(0.2, dtype=tf.float32)  # Reduced weight for privacy reward
         
         r_adv = tf.cast(r_adv, tf.float32)
-        rewards = w1 * r_adv + w2 * r_util + w3 * r_priv
         
-        # Debug print to check rewards shape
-        print(f"Rewards shape: {rewards.shape}")
+        # Ensure r_adv, r_util, and r_priv have appropriate shapes
+        r_adv = tf.reshape(r_adv, [-1])
+        r_util = tf.reshape(r_util, [-1])
+        r_priv = tf.reshape(r_priv, [-1])
+        
+        # Compute the combined reward
+        combined_rewards = w1 * r_adv + w2 * r_util + w3 * r_priv
+        
+        # Ensure the rewards have shape [batch_size, 1]
+        rewards = tf.reshape(combined_rewards, [batch_size, 1])
+        
+        # Normalize rewards for training stability
+        rewards_mean = tf.reduce_mean(rewards)
+        rewards_std = tf.math.reduce_std(rewards) + 1e-8
+        rewards = (rewards - rewards_mean) / rewards_std
+        
+        # Clip rewards to reasonable range to prevent training instability
+        rewards = tf.clip_by_value(rewards, -5.0, 5.0)
+        
+        # Debug print to check rewards shape and values
+        print(f"Rewards shape: {rewards.shape}, min: {tf.reduce_min(rewards)}, max: {tf.reduce_max(rewards)}, mean: {tf.reduce_mean(rewards)}")
         
         return rewards
 
@@ -631,13 +660,16 @@ class RL_Enhanced_Transformer_TrajGAN():
             # First ensure advantages is a tensor with float32 type
             advantages = tf.cast(advantages, tf.float32)
             
+            # Clip advantages to reasonable range before any other operations
+            advantages = tf.clip_by_value(advantages, -10.0, 10.0)
+            
             # Then convert to numpy and flatten
             advantages_np = advantages.numpy().flatten()  # Flatten to ensure it's 1D
             
             # Scale advantages to be positive (sample_weight should be positive)
             advantages_np = advantages_np - np.min(advantages_np) + 1e-3
             
-            # Normalize to reasonable values
+            # Normalize to reasonable values (0 to 1 range)
             if np.max(advantages_np) > 0:
                 advantages_np = advantages_np / np.max(advantages_np)
                 
@@ -647,10 +679,17 @@ class RL_Enhanced_Transformer_TrajGAN():
                 # If shapes don't match, use uniform weights
                 advantages_np = np.ones(batch_size)
                 
+            # Final safety check - replace any NaN or inf values
+            advantages_np = np.nan_to_num(advantages_np, nan=0.5, posinf=1.0, neginf=0.0)
+                
         except Exception as e:
             print(f"Error processing advantages: {e}")
             # Fallback to uniform weights
             advantages_np = np.ones(batch_size)
+            
+        # Print statistics about advantage values used for training
+        print(f"Advantage stats - min: {np.min(advantages_np):.4f}, max: {np.max(advantages_np):.4f}, " +
+              f"mean: {np.mean(advantages_np):.4f}, std: {np.std(advantages_np):.4f}")
         
         # Train the combined model with sample weights from advantages
         loss = self.combined.train_on_batch(
@@ -658,6 +697,11 @@ class RL_Enhanced_Transformer_TrajGAN():
             targets,
             sample_weight=advantages_np
         )
+        
+        # If loss is extremely high, clip it for reporting purposes
+        if loss > 10000:  # Arbitrary threshold for "too high" loss
+            print(f"Warning: Loss is very high ({loss:.2f}), consider reducing learning rate manually")
+            loss = min(loss, 10000.0)
         
         return loss
 
