@@ -2,10 +2,14 @@ import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
 import os
+import pandas as pd
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from data.csv2npy import data_conversion
 
 def load_raw_data(data_path):
-    """Load raw trajectory data"""
-    return np.load(data_path, allow_pickle=True)
+    """Load raw trajectory data from CSV"""
+    return pd.read_csv(data_path)
 
 def normalize_coordinates(trajectories, lat_centroid, lon_centroid, scale_factor):
     """Normalize latitude and longitude coordinates"""
@@ -52,13 +56,46 @@ def encode_categorical_features(trajectories, max_length):
 def preprocess_data(data_path, max_length, lat_centroid, lon_centroid, scale_factor):
     """Preprocess trajectory data"""
     # Load raw data
-    raw_data = load_raw_data(data_path)
+    train_df = pd.read_csv(os.path.join(os.path.dirname(data_path), 'train_latlon.csv'))
+    test_df = pd.read_csv(os.path.join(os.path.dirname(data_path), 'test_latlon.csv'))
     
-    # Encode trajectories
-    encoded_data = encode_categorical_features(raw_data, max_length)
+    # Convert to one-hot encoded numpy arrays
+    train_data = data_conversion(train_df, 'tid')
+    test_data = data_conversion(test_df, 'tid')
     
-    # Split data
-    train_data, temp_data = train_test_split(encoded_data, test_size=0.3, random_state=42)
-    val_data, test_data = train_test_split(temp_data, test_size=0.5, random_state=42)
+    # Split train into train and validation
+    train_indices = np.arange(len(train_data[0]))
+    train_idx, val_idx = train_test_split(train_indices, test_size=0.15, random_state=42)
     
-    return train_data, val_data, test_data 
+    # Create final datasets
+    train_final = [{
+        'lat_lon': train_data[0][i],
+        'day': train_data[1][i],
+        'hour': train_data[2][i],
+        'category': train_data[3][i],
+        'mask': train_data[4][i]
+    } for i in train_idx]
+    
+    val_final = [{
+        'lat_lon': train_data[0][i],
+        'day': train_data[1][i],
+        'hour': train_data[2][i],
+        'category': train_data[3][i],
+        'mask': train_data[4][i]
+    } for i in val_idx]
+    
+    test_final = [{
+        'lat_lon': test_data[0][i],
+        'day': test_data[1][i],
+        'hour': test_data[2][i],
+        'category': test_data[3][i],
+        'mask': test_data[4][i]
+    } for i in range(len(test_data[0]))]
+    
+    # Normalize coordinates
+    for dataset in [train_final, val_final, test_final]:
+        for traj in dataset:
+            traj['lat_lon'][:, 0] = (traj['lat_lon'][:, 0] - lat_centroid) / scale_factor
+            traj['lat_lon'][:, 1] = (traj['lat_lon'][:, 1] - lon_centroid) / scale_factor
+    
+    return train_final, val_final, test_final 
