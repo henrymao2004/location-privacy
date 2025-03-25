@@ -60,8 +60,8 @@ def preprocess_data(data_path, max_length, lat_centroid, lon_centroid, scale_fac
     test_df = pd.read_csv(os.path.join(os.path.dirname(data_path), 'test_latlon.csv'))
     
     # Convert to one-hot encoded numpy arrays
-    train_data = data_conversion(train_df, 'tid')
-    test_data = data_conversion(test_df, 'tid')
+    train_data = data_conversion(train_df, 'tid', max_length)
+    test_data = data_conversion(test_df, 'tid', max_length)
     
     # Split train into train and validation
     train_indices = np.arange(len(train_data[0]))
