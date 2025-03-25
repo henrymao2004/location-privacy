@@ -45,14 +45,27 @@ if __name__ == '__main__':
     
     # Initialize TUL classifier
     print("Initializing TUL classifier...")
-    num_users = len(np.unique(np.load('data/final_train.npy', allow_pickle=True)[-1]))  # Get number of unique users
+    # Load training data
+    train_data = np.load('data/final_train.npy', allow_pickle=True)
+    
+    # Get user IDs from the last element and convert to a flat list
+    user_ids = []
+    for user_array in train_data[-1]:
+        if isinstance(user_array, np.ndarray):
+            user_ids.extend(user_array.flatten().tolist())
+        else:
+            user_ids.append(user_array)
+    
+    num_users = len(set(user_ids))  # Get number of unique users
+    print(f"Found {num_users} unique users")
+    
     tul_classifier = TULClassifier(max_length, vocab_size, num_users)
     
     # Train TUL classifier if needed
     # This step can be skipped if you have a pre-trained classifier
     print("Training TUL classifier...")
-    trajectories = np.load('data/final_train.npy', allow_pickle=True)[0]  # Assuming first element contains trajectory data
-    users = np.load('data/final_train.npy', allow_pickle=True)[-1]        # Assuming last element contains user IDs
+    trajectories = train_data[0]  # First element contains trajectory data
+    users = np.array(user_ids)  # Convert to numpy array
     labels = np.ones(len(users))  # Create positive samples
     tul_classifier.train(trajectories, users, labels, epochs=10)
     

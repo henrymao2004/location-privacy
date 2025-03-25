@@ -32,50 +32,93 @@ class CriticNetwork(nn.Module):
         return value
 
 class RewardFunction:
-    def __init__(self, discriminator, tul_classifier, w1=0.3, w2=0.4, w3=0.3):
+    def __init__(self, discriminator, tul_classifier):
         self.discriminator = discriminator
         self.tul_classifier = tul_classifier
-        self.w1 = w1  # Weight for adversarial reward
-        self.w2 = w2  # Weight for utility reward
-        self.w3 = w3  # Weight for privacy reward
         
-    def compute_adversarial_reward(self, generated_traj):
-        """Compute R_adv based on discriminator output"""
-        with torch.no_grad():
-            d_score = self.discriminator(generated_traj)
-        return torch.log(d_score + 1e-8)  # Add small epsilon to avoid log(0)
+        # Configurable weights for reward components
+        self.w1 = 1.0  # Adversarial weight
+        self.w2 = 1.0  # Utility weight
+        self.w3 = 1.0  # Privacy weight
+        
+        # Weights for utility components
+        self.beta = 1.0   # Spatial loss weight
+        self.gamma = 1.0  # Temporal loss weight
+        self.chi = 1.0    # Categorical loss weight
+        
+        # Privacy weight
+        self.alpha = 1.0  # Privacy penalty weight
     
-    def compute_utility_reward(self, generated_traj, real_traj):
-        """Compute R_util based on spatial, temporal, and categorical losses"""
+    def compute_adversarial_reward(self, gen_traj):
+        """Compute adversarial reward based on discriminator's evaluation"""
+        # Convert to tensor if needed
+        if not isinstance(gen_traj, torch.Tensor):
+            gen_traj = torch.tensor(gen_traj, dtype=torch.float32)
+        
+        # Get discriminator's probability
+        d_prob = self.discriminator(gen_traj)
+        
+        # Compute log probability as reward
+        adv_reward = torch.log(d_prob + 1e-8)  # Add small epsilon to avoid log(0)
+        return adv_reward
+    
+    def compute_utility_reward(self, gen_traj, real_traj):
+        """Compute utility reward based on spatial, temporal, and categorical losses"""
+        # Convert to tensors if needed
+        if not isinstance(gen_traj, torch.Tensor):
+            gen_traj = torch.tensor(gen_traj, dtype=torch.float32)
+        if not isinstance(real_traj, torch.Tensor):
+            real_traj = torch.tensor(real_traj, dtype=torch.float32)
+        
         # Spatial loss (L2 distance)
-        spatial_loss = torch.mean(torch.square(generated_traj[0] - real_traj[0]))
+        spatial_loss = F.mse_loss(gen_traj[0], real_traj[0])  # L2 distance for coordinates
         
-        # Temporal loss (cross-entropy on time distributions)
-        temp_gen = torch.cat([generated_traj[2], generated_traj[3]], dim=-1)  # Combine day and hour
-        temp_real = torch.cat([real_traj[2], real_traj[3]], dim=-1)
-        temporal_loss = -torch.sum(temp_real * torch.log(temp_gen + 1e-8))
+        # Temporal loss (cross-entropy for day and hour)
+        day_loss = F.cross_entropy(gen_traj[1], torch.argmax(real_traj[1], dim=-1))
+        hour_loss = F.cross_entropy(gen_traj[2], torch.argmax(real_traj[2], dim=-1))
+        temporal_loss = day_loss + hour_loss
         
-        # Categorical loss
-        categorical_loss = -torch.sum(real_traj[1] * torch.log(generated_traj[1] + 1e-8))
+        # Categorical loss (cross-entropy for POI categories)
+        categorical_loss = F.cross_entropy(gen_traj[3], torch.argmax(real_traj[3], dim=-1))
         
         # Combine losses with weights
-        beta, gamma, chi = 0.4, 0.3, 0.3
-        utility_loss = -(beta * spatial_loss + gamma * temporal_loss + chi * categorical_loss)
-        return utility_loss
-    
-    def compute_privacy_reward(self, generated_traj, real_user):
-        """Compute R_priv based on TUL classifier output"""
-        with torch.no_grad():
-            link_prob = self.tul_classifier(generated_traj, real_user)
-        return -link_prob  # Negative because we want to minimize linkage probability
-    
-    def compute_total_reward(self, generated_traj, real_traj, real_user):
-        """Compute total reward as weighted sum of components"""
-        r_adv = self.compute_adversarial_reward(generated_traj)
-        r_util = self.compute_utility_reward(generated_traj, real_traj)
-        r_priv = self.compute_privacy_reward(generated_traj, real_user)
+        total_loss = (self.beta * spatial_loss + 
+                     self.gamma * temporal_loss + 
+                     self.chi * categorical_loss)
         
-        return self.w1 * r_adv + self.w2 * r_util + self.w3 * r_priv
+        # Convert loss to reward (negative loss)
+        util_reward = -total_loss
+        return util_reward
+    
+    def compute_privacy_reward(self, gen_traj, user_id):
+        """Compute privacy reward based on TUL classifier's accuracy"""
+        # Convert to tensor if needed
+        if not isinstance(gen_traj, torch.Tensor):
+            gen_traj = torch.tensor(gen_traj, dtype=torch.float32)
+        if not isinstance(user_id, torch.Tensor):
+            user_id = torch.tensor(user_id, dtype=torch.float32)
+        
+        # Get TUL classifier's probability for the correct user
+        with torch.no_grad():
+            link_prob = self.tul_classifier(gen_traj, user_id)
+        
+        # Compute privacy reward (negative probability)
+        priv_reward = -self.alpha * link_prob
+        return priv_reward
+    
+    def compute_total_reward(self, gen_traj, real_traj, user_id):
+        """Compute total reward combining all components"""
+        # Compute individual rewards
+        adv_reward = self.compute_adversarial_reward(gen_traj)
+        util_reward = self.compute_utility_reward(gen_traj, real_traj)
+        priv_reward = self.compute_privacy_reward(gen_traj, user_id)
+        
+        # Combine rewards with weights
+        total_reward = (self.w1 * adv_reward + 
+                       self.w2 * util_reward + 
+                       self.w3 * priv_reward)
+        
+        return total_reward
 
 class PPOAgent:
     def __init__(self, generator, critic, reward_function, epsilon=0.2):

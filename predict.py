@@ -1,10 +1,9 @@
 import sys
 import pandas as pd
 import numpy as np
-
-from model import LSTM_TrajGAN
-
-from keras.preprocessing.sequence import pad_sequences
+import torch
+from model import TrajGAN
+from transformer import TransformerBlock
 
 if __name__ == '__main__':
     n_epochs = int(sys.argv[1])
@@ -32,60 +31,52 @@ if __name__ == '__main__':
                          abs(te['lon'].min() - lon_centroid),
                         ))
     
-    gan = LSTM_TrajGAN(latent_dim, keys, vocab_size, max_length, lat_centroid, lon_centroid, scale_factor)
+    # Initialize model
+    gan = TrajGAN(
+        latent_dim=latent_dim,
+        keys=keys,
+        vocab_size=vocab_size,
+        max_length=max_length,
+        lat_centroid=lat_centroid,
+        lon_centroid=lon_centroid,
+        scale_factor=scale_factor
+    )
+    
+    # Load the trained generator
+    gan.generator.load_state_dict(torch.load(f'params/G_model_{n_epochs}.pt'))
+    gan.generator.eval()
     
     # Test data
-    x_test = np.load('data/final_test.npy',allow_pickle=True)
+    x_test = np.load('data/final_test.npy', allow_pickle=True)
     
-    x_test = [x_test[0],x_test[1],x_test[2],x_test[3],x_test[4],x_test[5].reshape(-1,1),x_test[6].reshape(-1,1)]
-    X_test = [pad_sequences(f, max_length, padding='pre', dtype='float64') for f in x_test[:5]]
+    # Prepare input data
+    X_test = []
+    for i in range(5):  # First 5 elements are trajectory data
+        X_test.append(torch.tensor(x_test[i], dtype=torch.float32))
     
-    # Add random noise to the data
-    noise = np.random.normal(0, 1, (1027, 100))
+    # Add random noise
+    noise = torch.randn(len(x_test[0]), latent_dim)
     X_test.append(noise)
     
-    # Load params for the generator
-    gan.generator.load_weights('training_params/G_model_' + str(n_epochs) + '.h5') # params/G_model_2000.h5
+    # Generate trajectories
+    print("Generating synthetic trajectories...")
+    with torch.no_grad():
+        gen_trajs = gan.generator(X_test)
     
-    # Make predictions
-    prediction = gan.generator.predict(X_test)
+    # Convert generated trajectories to DataFrame format
+    print("Converting to DataFrame format...")
+    syn_trajs = pd.DataFrame({
+        'lat': gen_trajs[0][:, :, 0].flatten().numpy(),
+        'lon': gen_trajs[0][:, :, 1].flatten().numpy(),
+        'day': torch.argmax(gen_trajs[1], dim=-1).flatten().numpy(),
+        'hour': torch.argmax(gen_trajs[2], dim=-1).flatten().numpy(),
+        'category': torch.argmax(gen_trajs[3], dim=-1).flatten().numpy()
+    })
     
-    traj_attr_concat_list = []
-    for attributes in prediction:
-        traj_attr_list = []
-        idx = 0
-        for row in attributes:
-            if row.shape == (max_length, 2):
-                traj_attr_list.append(row[max_length-x_test[6][idx][0]:])
-            else:
-                traj_attr_list.append(np.argmax(row[max_length-x_test[6][idx][0]:],axis=1).reshape(x_test[6][idx][0],1))
-            idx += 1
-        traj_attr_concat = np.concatenate(traj_attr_list)
-        traj_attr_concat_list.append(traj_attr_concat)
-    traj_data = np.concatenate(traj_attr_concat_list,axis=1)
-    
-    df_test = pd.read_csv('data/dev_test_encoded_final.csv')
-    label = np.array(df_test['label']).reshape(-1,1)
-    tid = np.array(df_test['tid']).reshape(-1,1)
-    traj_data = np.concatenate([label,tid,traj_data],axis=1)
-    df_traj_fin = pd.DataFrame(traj_data)
-    
-    df_traj_fin.columns = ['label','tid','lat','lon','day', 'hour', 'category','mask']
-    
-    # Convert location deviation to longtitude and latitude
-    df_traj_fin['lat'] = df_traj_fin['lat'] + gan.lat_centroid
-    df_traj_fin['lon'] = df_traj_fin['lon'] + gan.lon_centroid
-    
-    del df_traj_fin['mask']
-    
-    df_traj_fin['tid'] = df_traj_fin['tid'].astype(np.int32)
-    df_traj_fin['day'] = df_traj_fin['day'].astype(np.int32)
-    df_traj_fin['hour'] = df_traj_fin['hour'].astype(np.int32)
-    df_traj_fin['category'] = df_traj_fin['category'].astype(np.int32)
-    df_traj_fin['label'] = df_traj_fin['label'].astype(np.int32)
-    
-    # Save synthetic trajectory data
-    df_traj_fin.to_csv('results/syn_traj_test.csv',index=False)
+    # Save synthetic trajectories
+    print("Saving synthetic trajectories...")
+    syn_trajs.to_csv('results/syn_traj_test.csv', index=False)
+    print("Synthetic trajectories saved to results/syn_traj_test.csv")
     
     
     
