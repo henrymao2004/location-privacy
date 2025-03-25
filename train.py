@@ -76,7 +76,7 @@ def main():
     
     # Initialize TUL classifier (MARC)
     tul_classifier = MARC()
-    tul_classifier.load_weights('MARC/weights/marc_weights.h5')
+    tul_classifier.load_weights('MARC/weights/MARC_Weight.h5')
     
     # Initialize and train the model
     model = RL_Enhanced_Transformer_TrajGAN(

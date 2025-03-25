@@ -9,7 +9,7 @@ import json
 
 random.seed(2020)
 np.random.seed(2020)
-tf.random.set_random_seed(2020)
+tf.random.set_seed(2020)
 
 from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, MultiHeadAttention, LayerNormalization, Dropout
 from keras.initializers import he_uniform
