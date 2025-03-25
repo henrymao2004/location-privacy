@@ -1,11 +1,34 @@
 import tensorflow as tf
 import keras
 import numpy as np
-from keras.layers import Input, Dense, LSTM, Lambda, TimeDistributed
+from keras.layers import Input, Dense, LSTM, Lambda, TimeDistributed, LayerNormalization, MultiHeadAttention, Dropout, GlobalAveragePooling1D
 from keras.models import Model
 from keras.optimizers import Adam
 from keras.initializers import he_uniform
 from keras.regularizers import l1
+
+class TransformerBlock(tf.keras.layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
+        super(TransformerBlock, self).__init__()
+        
+        self.att = MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = Sequential([
+            Dense(ff_dim, activation="relu"),
+            Dense(embed_dim),
+        ])
+        
+        self.layernorm1 = LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        self.dropout1 = Dropout(rate)
+        self.dropout2 = Dropout(rate)
+        
+    def call(self, inputs, training=False):
+        attn_output = self.att(inputs, inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
 
 class CriticNetwork:
     def __init__(self, max_length, vocab_size):
@@ -18,11 +41,15 @@ class CriticNetwork:
         # Input is the trajectory state (partial trajectory so far)
         traj_input = Input(shape=(self.max_length, sum(self.vocab_size.values())))
         
-        # LSTM to process trajectory
-        lstm_out = LSTM(units=100, recurrent_regularizer=l1(0.02))(traj_input)
+        # Transformer to process trajectory
+        transformer_block = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)
+        transformer_output = transformer_block(traj_input)
+        
+        # Global average pooling to reduce sequence dimension
+        avg_pool = GlobalAveragePooling1D()(transformer_output)
         
         # Value prediction
-        value = Dense(1, activation='linear')(lstm_out)
+        value = Dense(1, activation='linear')(avg_pool)
         
         model = Model(inputs=traj_input, outputs=value)
         model.compile(loss='mse', optimizer=self.optimizer)

@@ -1,9 +1,32 @@
 import tensorflow as tf
 import keras
 import numpy as np
-from keras.layers import Input, Dense, LSTM, Concatenate, Dropout
+from keras.layers import Input, Dense, LSTM, Concatenate, Dropout, LayerNormalization, MultiHeadAttention, GlobalAveragePooling1D
 from keras.models import Model
 from keras.optimizers import Adam
+
+class TransformerBlock(tf.keras.layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
+        super(TransformerBlock, self).__init__()
+        
+        self.att = MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = Sequential([
+            Dense(ff_dim, activation="relu"),
+            Dense(embed_dim),
+        ])
+        
+        self.layernorm1 = LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        self.dropout1 = Dropout(rate)
+        self.dropout2 = Dropout(rate)
+        
+    def call(self, inputs, training=False):
+        attn_output = self.att(inputs, inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
 
 class TULClassifier:
     def __init__(self, max_length, vocab_size, num_users):
@@ -17,12 +40,18 @@ class TULClassifier:
         # Trajectory input
         traj_input = Input(shape=(self.max_length, sum(self.vocab_size.values())))
         
-        # LSTM layers for trajectory encoding
-        lstm1 = LSTM(128, return_sequences=True)(traj_input)
-        lstm2 = LSTM(64)(lstm1)
+        # Transformer layers for trajectory encoding
+        transformer_block1 = TransformerBlock(embed_dim=128, num_heads=4, ff_dim=256, rate=0.1)
+        transformer_block2 = TransformerBlock(embed_dim=128, num_heads=4, ff_dim=256, rate=0.1)
+        
+        x = transformer_block1(traj_input)
+        x = transformer_block2(x)
+        
+        # Global average pooling to reduce sequence dimension
+        x = GlobalAveragePooling1D()(x)
         
         # Dense layers for trajectory features
-        dense1 = Dense(128, activation='relu')(lstm2)
+        dense1 = Dense(128, activation='relu')(x)
         dropout1 = Dropout(0.3)(dense1)
         dense2 = Dense(64, activation='relu')(dropout1)
         

@@ -8,7 +8,7 @@ random.seed(2020)
 np.random.seed(2020)
 tf.random.set_random_seed(2020)
 
-from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding
+from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, LayerNormalization, MultiHeadAttention, Dropout
 from keras.initializers import he_uniform
 from keras.regularizers import l1
 
@@ -17,6 +17,29 @@ from keras.optimizers import Adam
 from keras.preprocessing.sequence import pad_sequences
 
 from losses import d_bce_loss, trajLoss
+
+class TransformerBlock(tf.keras.layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
+        super(TransformerBlock, self).__init__()
+        
+        self.att = MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = Sequential([
+            Dense(ff_dim, activation="relu"),
+            Dense(embed_dim),
+        ])
+        
+        self.layernorm1 = LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        self.dropout1 = Dropout(rate)
+        self.dropout2 = Dropout(rate)
+        
+    def call(self, inputs, training=False):
+        attn_output = self.att(inputs, inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
 
 class LSTM_TrajGAN():
     def __init__(self, latent_dim, keys, vocab_size, max_length, lat_centroid, lon_centroid, scale_factor, tul_classifier=None):
@@ -79,7 +102,6 @@ class LSTM_TrajGAN():
             json_file.write(Critic_model_json)
 
     def build_discriminator(self):
-        
         # Input Layer
         inputs = []
         
@@ -113,16 +135,19 @@ class LSTM_TrajGAN():
         dense_outputs = [d(x) for x in unstacked]
         emb_traj = Lambda(lambda x: tf.stack(x, axis=1))(dense_outputs)
         
-        # LSTM Modeling Layer (many-to-one)
-        lstm_cell = LSTM(units=100, recurrent_regularizer=l1(0.02))(emb_traj)
+        # Transformer Modeling Layer
+        transformer_block = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)
+        transformer_output = transformer_block(emb_traj)
+        
+        # Global average pooling to reduce sequence dimension
+        avg_pool = tf.keras.layers.GlobalAveragePooling1D()(transformer_output)
         
         # Output
-        sigmoid = Dense(1, activation='sigmoid')(lstm_cell)
+        sigmoid = Dense(1, activation='sigmoid')(avg_pool)
 
         return Model(inputs=inputs, outputs=sigmoid)
 
     def build_generator(self):
-        
         # Input Layer
         inputs = []
         
@@ -157,11 +182,9 @@ class LSTM_TrajGAN():
         dense_outputs = [d(Concatenate(axis=1)([x, noise])) for x in unstacked]
         emb_traj = Lambda(lambda x: tf.stack(x, axis=1))(dense_outputs)
         
-        # LSTM Modeling Layer (many-to-many)
-        lstm_cell = LSTM(units=100,
-                        batch_input_shape=(None, self.max_length, 100),
-                        return_sequences=True,
-                        recurrent_regularizer=l1(0.02))(emb_traj)
+        # Transformer Modeling Layer
+        transformer_block = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)
+        transformer_output = transformer_block(emb_traj)
         
         # Outputs
         outputs = []
@@ -170,12 +193,12 @@ class LSTM_TrajGAN():
                 output_mask = Lambda(lambda x: x)(mask)
                 outputs.append(output_mask)
             elif key == 'lat_lon':
-                output = TimeDistributed(Dense(2, activation='tanh'), name='output_latlon')(lstm_cell)
+                output = TimeDistributed(Dense(2, activation='tanh'), name='output_latlon')(transformer_output)
                 scale_factor = self.scale_factor
                 output_stratched = Lambda(lambda x: x * scale_factor)(output)
                 outputs.append(output_stratched)
             else:
-                output = TimeDistributed(Dense(self.vocab_size[key], activation='softmax'), name='output_' + key)(lstm_cell)
+                output = TimeDistributed(Dense(self.vocab_size[key], activation='softmax'), name='output_' + key)(transformer_output)
                 outputs.append(output)
                 
         return Model(inputs=inputs, outputs=outputs)
