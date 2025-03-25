@@ -1,6 +1,6 @@
 import os
 import yaml
-import tensorflow as tf
+import torch
 import numpy as np
 from src.data.preprocess import preprocess_data
 from src.data.dataset import TrajectoryDataset
@@ -21,6 +21,9 @@ def main():
     # Create necessary directories
     for path in config['paths'].values():
         os.makedirs(path, exist_ok=True)
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Preprocess data
     print("Preprocessing data...")
@@ -49,10 +52,11 @@ def main():
         w1=config['training']['reward_weights']['w1'],
         w2=config['training']['reward_weights']['w2'],
         w3=config['training']['reward_weights']['w3']
-    )
+    ).to(device)
     
     # Load TUL classifier
-    tul_classifier = tf.keras.models.load_model(config['paths']['tul_classifier'])
+    tul_classifier = torch.load(config['paths']['tul_classifier']).to(device)
+    tul_classifier.eval()
     
     # Initialize trainer
     trainer = PPOTrainer(
@@ -60,7 +64,8 @@ def main():
         tul_classifier=tul_classifier,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
-        config=config['training']
+        config=config['training'],
+        device=device
     )
     
     # Train model
@@ -81,9 +86,10 @@ def main():
         'utility_metrics': utility_metrics,
         'training_history': history
     }
-    np.save(os.path.join(config['paths']['results'], 'evaluation_metrics.npy'), results)
     
-    print("Training completed successfully!")
+    results_path = os.path.join(config['paths']['results'], 'final_results.yaml')
+    with open(results_path, 'w') as f:
+        yaml.dump(results, f)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main() 

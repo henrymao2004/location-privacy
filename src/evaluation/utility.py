@@ -1,6 +1,5 @@
 import numpy as np
-import tensorflow as tf
-import tensorflow_probability as tfp
+import torch
 from scipy.stats import entropy
 
 def compute_fid(real_features, gen_features):
@@ -26,15 +25,24 @@ def compute_jsd(p, q):
 
 def evaluate_utility(model, test_data):
     """Evaluate utility preservation using FID and JSD metrics"""
+    model.eval()
+    
     # Generate synthetic trajectories
-    noise = tf.random.normal([len(test_data), model.latent_dim])
-    gen_trajs = model.generator.predict([*test_data[:4], test_data[4], noise])
+    with torch.no_grad():
+        noise = torch.randn(len(test_data), model.latent_dim, device=model.device)
+        gen_trajs = model.generator([*test_data[:4], test_data[4], noise])
+        
+        # Get features from discriminator
+        real_features = model.discriminator.get_features(test_data)
+        gen_features = model.discriminator.get_features(gen_trajs)
+        
+        # Convert to numpy for metric computation
+        real_features = real_features.cpu().numpy()
+        gen_features = gen_features.cpu().numpy()
     
     metrics = {}
     
     # FID Score
-    real_features = model.discriminator.get_layer('global_average_pooling1d').output
-    gen_features = model.discriminator.get_layer('global_average_pooling1d').output
     metrics['fid'] = compute_fid(real_features, gen_features)
     
     # JSD for each feature

@@ -1,5 +1,5 @@
 import numpy as np
-import tensorflow as tf
+import torch
 from sklearn.model_selection import train_test_split
 import os
 
@@ -27,13 +27,13 @@ def encode_categorical_features(trajectories, max_length):
         encoded_traj['lat_lon'] = np.column_stack([traj['lat'], traj['lon']])
         
         # Encode day (0-6)
-        encoded_traj['day'] = tf.keras.utils.to_categorical(traj['day'], num_classes=7)
+        encoded_traj['day'] = np.eye(7)[traj['day']]
         
         # Encode hour (0-23)
-        encoded_traj['hour'] = tf.keras.utils.to_categorical(traj['hour'], num_classes=24)
+        encoded_traj['hour'] = np.eye(24)[traj['hour']]
         
         # Encode category
-        encoded_traj['category'] = tf.keras.utils.to_categorical(traj['category'], num_classes=10)
+        encoded_traj['category'] = np.eye(10)[traj['category']]
         
         # Create mask
         encoded_traj['mask'] = np.ones((len(traj['lat']), 1))
@@ -49,43 +49,16 @@ def encode_categorical_features(trajectories, max_length):
         encoded.append(encoded_traj)
     return encoded
 
-def split_data(data, train_ratio, val_ratio, test_ratio, random_state=42):
-    """Split data into train, validation, and test sets"""
-    # First split: train and temp
-    train_data, temp_data = train_test_split(
-        data, 
-        test_size=1-train_ratio,
-        random_state=random_state
-    )
-    
-    # Second split: validation and test
-    val_size = val_ratio / (val_ratio + test_ratio)
-    val_data, test_data = train_test_split(
-        temp_data,
-        test_size=1-val_size,
-        random_state=random_state
-    )
-    
-    return train_data, val_data, test_data
-
-def preprocess_data(data_path, max_length, lat_centroid, lon_centroid, scale_factor,
-                   train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
-    """Complete data preprocessing pipeline"""
+def preprocess_data(data_path, max_length, lat_centroid, lon_centroid, scale_factor):
+    """Preprocess trajectory data"""
     # Load raw data
     raw_data = load_raw_data(data_path)
     
-    # Normalize coordinates
-    normalized_data = normalize_coordinates(raw_data, lat_centroid, lon_centroid, scale_factor)
-    
-    # Encode categorical features
-    encoded_data = encode_categorical_features(normalized_data, max_length)
+    # Encode trajectories
+    encoded_data = encode_categorical_features(raw_data, max_length)
     
     # Split data
-    train_data, val_data, test_data = split_data(
-        encoded_data,
-        train_ratio,
-        val_ratio,
-        test_ratio
-    )
+    train_data, temp_data = train_test_split(encoded_data, test_size=0.3, random_state=42)
+    val_data, test_data = train_test_split(temp_data, test_size=0.5, random_state=42)
     
     return train_data, val_data, test_data 

@@ -1,16 +1,24 @@
 import numpy as np
-import tensorflow as tf
+import torch
 from sklearn.metrics import precision_score, recall_score, f1_score
 
 def evaluate_privacy(model, test_data, tul_classifier):
     """Evaluate privacy protection using TUL-based metrics"""
-    # Generate synthetic trajectories
-    noise = tf.random.normal([len(test_data), model.latent_dim])
-    gen_trajs = model.generator.predict([*test_data[:4], test_data[4], noise])
+    model.eval()
+    tul_classifier.eval()
     
-    # Get predictions from TUL classifier
-    real_pred = tul_classifier.predict(test_data)
-    gen_pred = tul_classifier.predict(gen_trajs)
+    # Generate synthetic trajectories
+    with torch.no_grad():
+        noise = torch.randn(len(test_data), model.latent_dim, device=model.device)
+        gen_trajs = model.generator([*test_data[:4], test_data[4], noise])
+        
+        # Get predictions from TUL classifier
+        real_pred = tul_classifier(test_data)
+        gen_pred = tul_classifier(gen_trajs)
+        
+        # Convert to numpy for metric computation
+        real_pred = real_pred.cpu().numpy()
+        gen_pred = gen_pred.cpu().numpy()
     
     # Compute metrics
     metrics = {}
