@@ -1,6 +1,7 @@
 import tensorflow as tf
 from keras.losses import binary_crossentropy
 import keras
+from keras.layers import Layer
 import numpy as np
 
 # BCE loss for the discriminator
@@ -11,93 +12,139 @@ def d_bce_loss(mask):
 
     return loss
 
-# trajLoss for the generator
-def trajLoss(real_traj, gen_traj):
-    def loss(y_true, y_pred):
-        traj_length = keras.backend.sum(real_traj[4],axis=1)
+# Custom layer for trajectory loss
+class TrajLossLayer(Layer):
+    def __init__(self, p_bce=1, p_latlon=10, p_cat=1, p_day=1, p_hour=1, **kwargs):
+        super(TrajLossLayer, self).__init__(**kwargs)
+        self.p_bce = p_bce
+        self.p_latlon = p_latlon
+        self.p_cat = p_cat
+        self.p_day = p_day
+        self.p_hour = p_hour
+    
+    def call(self, inputs):
+        y_true, y_pred, real_traj, gen_traj = inputs
+        
+        # Use Keras operations instead of direct TensorFlow ops
+        traj_length = keras.ops.sum(real_traj[4], axis=1)
         
         bce_loss = binary_crossentropy(y_true, y_pred)
         
-        masked_latlon_full = keras.backend.sum(keras.backend.sum(tf.multiply(tf.multiply((gen_traj[0]-real_traj[0]),(gen_traj[0]-real_traj[0])),tf.concat([real_traj[4] for x in range(2)],axis=2)),axis=1),axis=1,keepdims=True)
-        masked_latlon_mse = keras.backend.sum(tf.math.divide(masked_latlon_full,traj_length))
+        # Compute MSE for lat/lon
+        diff = gen_traj[0] - real_traj[0]
+        squared_diff = diff * diff
+        mask_repeated = keras.ops.concatenate([real_traj[4] for _ in range(2)], axis=2)
+        masked_squared_diff = squared_diff * mask_repeated
+        masked_latlon_full = keras.ops.sum(keras.ops.sum(masked_squared_diff, axis=1), axis=1, keepdims=True)
+        masked_latlon_mse = keras.ops.sum(masked_latlon_full / keras.ops.expand_dims(traj_length, axis=1))
         
-        ce_category = tf.nn.softmax_cross_entropy_with_logits_v2(gen_traj[1],real_traj[1])
-        ce_day = tf.nn.softmax_cross_entropy_with_logits_v2(gen_traj[2],real_traj[2])
-        ce_hour = tf.nn.softmax_cross_entropy_with_logits_v2(gen_traj[3],real_traj[3])
+        # Cross entropy for categories
+        ce_category = keras.ops.categorical_crossentropy(real_traj[1], gen_traj[1], from_logits=True)
+        ce_day = keras.ops.categorical_crossentropy(real_traj[2], gen_traj[2], from_logits=True)
+        ce_hour = keras.ops.categorical_crossentropy(real_traj[3], gen_traj[3], from_logits=True)
         
-        ce_category_masked = tf.multiply(ce_category,keras.backend.sum(real_traj[4],axis=2))
-        ce_day_masked = tf.multiply(ce_day,keras.backend.sum(real_traj[4],axis=2))
-        ce_hour_masked = tf.multiply(ce_hour,keras.backend.sum(real_traj[4],axis=2))
+        # Apply masks
+        mask_sum = keras.ops.sum(real_traj[4], axis=2)
+        ce_category_masked = ce_category * mask_sum
+        ce_day_masked = ce_day * mask_sum
+        ce_hour_masked = ce_hour * mask_sum
         
-        ce_category_mean = keras.backend.sum(tf.math.divide(ce_category_masked,traj_length))
-        ce_day_mean = keras.backend.sum(tf.math.divide(ce_day_masked,traj_length))
-        ce_hour_mean = keras.backend.sum(tf.math.divide(ce_hour_masked,traj_length))
+        # Compute mean
+        ce_category_mean = keras.ops.sum(ce_category_masked / keras.ops.expand_dims(traj_length, axis=1))
+        ce_day_mean = keras.ops.sum(ce_day_masked / keras.ops.expand_dims(traj_length, axis=1))
+        ce_hour_mean = keras.ops.sum(ce_hour_masked / keras.ops.expand_dims(traj_length, axis=1))
         
-        p_bce = 1
-        p_latlon = 10
-        p_cat = 1
-        p_day = 1
-        p_hour = 1
+        # Combined loss
+        total_loss = (bce_loss * self.p_bce + 
+                      masked_latlon_mse * self.p_latlon + 
+                      ce_category_mean * self.p_cat + 
+                      ce_day_mean * self.p_day + 
+                      ce_hour_mean * self.p_hour)
         
-        return bce_loss*p_bce + masked_latlon_mse*p_latlon + ce_category_mean*p_cat + ce_day_mean*p_day + ce_hour_mean*p_hour
+        return total_loss
 
+# trajLoss function that returns a loss function compatible with Keras
+def trajLoss(real_traj, gen_traj):
+    loss_layer = TrajLossLayer()
+    
+    def loss(y_true, y_pred):
+        return loss_layer([y_true, y_pred, real_traj, gen_traj])
+    
     return loss
 
-def compute_advantage(rewards, values, gamma, gae_lambda):
-    """Compute Generalized Advantage Estimation (GAE).
+def compute_advantage(rewards, values, gamma=0.99, gae_lambda=0.95):
+    """Compute Generalized Advantage Estimation (GAE) as in the paper.
     
     Args:
-        rewards: Tensor of shape [batch_size, max_length] containing rewards
-        values: Tensor of shape [batch_size, max_length] containing value estimates
+        rewards: Tensor of shape [batch_size, 1] containing rewards
+        values: Tensor of shape [batch_size, 1] containing value estimates
         gamma: Discount factor
         gae_lambda: GAE parameter
         
     Returns:
-        advantages: Tensor of shape [batch_size, max_length] containing advantages
+        advantages: Tensor of shape [batch_size, 1] containing advantages
     """
-    advantages = tf.zeros_like(rewards)
-    gae = 0
+    # Flatten rewards and values
+    rewards = tf.reshape(rewards, [-1])
+    values = tf.reshape(values, [-1])
     
-    for t in reversed(range(rewards.shape[1])):
-        if t == rewards.shape[1] - 1:
-            next_value = 0
-        else:
-            next_value = values[:, t + 1]
-            
-        delta = rewards[:, t] + gamma * next_value - values[:, t]
-        gae = delta + gamma * gae_lambda * gae
+    # Initialize advantages
+    advantages = tf.zeros_like(rewards)
+    
+    # Terminal value is zero
+    last_gae_lam = 0
+    
+    # Loop backwards through rewards
+    for t in reversed(range(len(rewards))):
+        # If t is the last step, next value is 0, otherwise it's values[t+1]
+        next_value = 0 if t == len(rewards) - 1 else values[t+1]
+        
+        # Delta = reward + gamma * next_value - current_value
+        delta = rewards[t] + gamma * next_value - values[t]
+        
+        # GAE formula: A_t = delta_t + gamma * lambda * A_{t+1}
+        last_gae_lam = delta + gamma * gae_lambda * last_gae_lam
         advantages = tf.tensor_scatter_nd_update(
             advantages,
-            tf.stack([tf.range(rewards.shape[0]), tf.fill([rewards.shape[0]], t)], axis=1),
-            gae
+            [[t]],
+            [last_gae_lam]
         )
     
     # Normalize advantages
-    advantages = (advantages - tf.reduce_mean(advantages)) / (tf.reduce_std(advantages) + 1e-8)
-    return advantages
+    advantages = (advantages - tf.reduce_mean(advantages)) / (tf.math.reduce_std(advantages) + 1e-8)
+    
+    return tf.reshape(advantages, [-1, 1])
 
-def compute_returns(rewards, gamma):
-    """Compute returns (discounted sum of rewards).
+def compute_returns(rewards, gamma=0.99):
+    """Compute discounted returns (sum of future rewards).
     
     Args:
-        rewards: Tensor of shape [batch_size, max_length] containing rewards
+        rewards: Tensor of shape [batch_size, 1] containing rewards
         gamma: Discount factor
         
     Returns:
-        returns: Tensor of shape [batch_size, max_length] containing returns
+        returns: Tensor of shape [batch_size, 1] containing returns
     """
+    # Flatten rewards
+    rewards = tf.reshape(rewards, [-1])
+    
+    # Initialize returns
     returns = tf.zeros_like(rewards)
+    
+    # Initialize running return
     running_return = 0
     
-    for t in reversed(range(rewards.shape[1])):
-        running_return = rewards[:, t] + gamma * running_return
+    # Loop backwards through rewards
+    for t in reversed(range(len(rewards))):
+        # G_t = r_t + gamma * G_{t+1}
+        running_return = rewards[t] + gamma * running_return
         returns = tf.tensor_scatter_nd_update(
             returns,
-            tf.stack([tf.range(rewards.shape[0]), tf.fill([rewards.shape[0]], t)], axis=1),
-            running_return
+            [[t]],
+            [running_return]
         )
     
-    return returns
+    return tf.reshape(returns, [-1, 1])
 
 def compute_entropy_loss(action_probs):
     """Compute entropy loss to encourage exploration.
@@ -112,3 +159,49 @@ def compute_entropy_loss(action_probs):
         action_probs * tf.math.log(action_probs + 1e-10),
         axis=-1
     ))
+
+def compute_trajectory_ratio(new_predictions, old_predictions):
+    """Compute the PPO policy ratio between new and old policies for trajectory data.
+    
+    For trajectories, we take the product of point-wise prediction ratios,
+    which is equivalent to the ratio of trajectory probabilities under each policy.
+    
+    Args:
+        new_predictions: Outputs from the current policy
+        old_predictions: Outputs from the old policy before update
+        
+    Returns:
+        Tensor of shape [batch_size, 1] containing the policy ratios
+    """
+    # Initialize ratio as ones
+    ratio = tf.ones(shape=(len(new_predictions[0]), 1))
+    
+    # For each categorical output (category, day, hour), compute ratio
+    for i in range(1, 4):  # Categorical outputs
+        # Get probabilities under new policy
+        new_probs = new_predictions[i]
+        
+        # Get probabilities under old policy
+        old_probs = old_predictions[i]
+        
+        # Compute the ratio of probabilities (with small epsilon to avoid division by zero)
+        point_ratio = new_probs / (old_probs + 1e-10)
+        
+        # Reduce along the category dimension to get per-point ratio
+        point_ratio = tf.reduce_sum(point_ratio, axis=-1, keepdims=True)
+        
+        # Multiply with current ratio
+        ratio = ratio * point_ratio
+    
+    # For continuous outputs (coordinates), use normal distribution likelihood ratio
+    coord_ratio = tf.exp(-0.5 * tf.reduce_sum(tf.square(new_predictions[0] - old_predictions[0]), axis=-1, keepdims=True))
+    ratio = ratio * coord_ratio
+    
+    # Mask out padding
+    mask = new_predictions[4]
+    ratio = ratio * mask
+    
+    # Average over the trajectory length
+    ratio = tf.reduce_mean(ratio, axis=1)
+    
+    return ratio
