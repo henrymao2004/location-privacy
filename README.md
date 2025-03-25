@@ -1,189 +1,124 @@
-# RL-Enhanced Transformer-TrajGAN
+# LSTM-TrajGAN
 
-This repository implements a Reinforcement Learning (RL) enhanced Transformer-based Trajectory GAN for privacy-preserving trajectory generation. The model uses a transformer architecture with PPO optimization to balance privacy and utility in generated trajectories.
+LSTM-TrajGAN: A Deep Learning Approach to Trajectory Generation and Privacy Protection
 
-## Project Structure
+## Abstract
+The prevalence of location-based services contributes to the explosive growth of individual-level location trajectory data and raises public concerns about privacy issues. In this research, we propose a novel LSTM-TrajGAN approach, which is an end-to-end deep learning model to generate privacy-preserving synthetic trajectory data for data sharing and publication. We design a loss metric function TrajLoss to measure the trajectory similarity losses for model training and optimization. The model is evaluated on the trajectory-user-linking task on a real-world semantic trajectory dataset. Compared with other common geomasking methods, our model can better prevent users from being re-identified, and it also preserves essential spatial, temporal, and thematic characteristics of the real trajectory data. The model better balances the effectiveness of trajectory privacy protection and the utility for spatial and temporal analyses, which offers new insights into the GeoAI-powered privacy protection for human mobility studies.
+
+<p align="center">
+    <img src="results/workflow.png" alt="workflow" >
+</p>
+<p align="center">
+    <img src="results/trajectory_example.png" alt="trajectory_example" >
+</p>
+
+## Reference
+If you find our code or ideas useful for your research, please cite our paper:
+
+*Rao, J., Gao, S.\*, Kang, Y. and Huang, Q. (2020). [LSTM-TrajGAN: A Deep Learning Approach to Trajectory Privacy Protection](https://drops.dagstuhl.de/opus/volltexte/2020/13047/). In the Proceedings of the 11th International Conference on Geographic Information Science (GIScience 2021), 12:1--12:17.*
 
 ```
-.
-├── configs/
-│   └── config.yaml         # Configuration parameters
-├── data/
-│   └── raw_data.npy        # Raw trajectory data
-├── src/
-│   ├── data/
-│   │   ├── preprocess.py   # Data preprocessing
-│   │   └── dataset.py      # Dataset class
-│   ├── models/
-│   │   └── transformer.py  # Transformer model implementation
-│   ├── training/
-│   │   └── trainer.py      # PPO training implementation
-│   └── evaluation/
-│       ├── privacy.py      # Privacy evaluation metrics
-│       └── utility.py      # Utility evaluation metrics
-├── results/                # Training results and metrics
-└── main.py                # Main training script
+@InProceedings{rao_et_al:LIPIcs:2020:13047,
+  author =	{Jinmeng Rao and Song Gao and Yuhao Kang and Qunying Huang},
+  title =	{{LSTM-TrajGAN: A Deep Learning Approach to Trajectory Privacy Protection}},
+  booktitle =	{11th International Conference on Geographic Information Science (GIScience 2021) - Part I},
+  pages =	{12:1--12:17},
+  series =	{Leibniz International Proceedings in Informatics (LIPIcs)},
+  ISBN =	{978-3-95977-166-5},
+  ISSN =	{1868-8969},
+  year =	{2020},
+  volume =	{177},
+  editor =	{Krzysztof Janowicz and Judith A. Verstegen},
+  publisher =	{Schloss Dagstuhl--Leibniz-Zentrum f{\"u}r Informatik},
+  address =	{Dagstuhl, Germany},
+  URL =		{https://drops.dagstuhl.de/opus/volltexte/2020/13047},
+  URN =		{urn:nbn:de:0030-drops-130471},
+  doi =		{10.4230/LIPIcs.GIScience.2021.I.12},
+  annote =	{Keywords: GeoAI, Deep Learning, Trajectory Privacy, Generative Adversarial Networks}
+}
 ```
 
-## Prerequisites
+## Related work
+*Rao, J., Gao, S.\*, and Zhu, S. (2023). [CATS: Conditional Adversarial Trajectory Synthesis for privacy-preserving trajectory data publication using deep learning approaches](https://www.tandfonline.com/doi/abs/10.1080/13658816.2023.2262550). In International Journal of Geographical Information Science, 37:12,2538--2574.
 
-- Python 3.8+
-- TensorFlow 2.8+
-- NumPy
-- Pandas
-- Matplotlib
-- PyYAML
-- scikit-learn
-- scipy
-
-## Installation
-
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/RL-Transformer-TrajGAN.git
-cd RL-Transformer-TrajGAN
+```
+@article{rao2023cats,
+  title={CATS: Conditional Adversarial Trajectory Synthesis for privacy-preserving trajectory data publication using deep learning approaches},
+  author={Rao, Jinmeng and Gao, Song and Zhu, Sijia},
+  journal={International Journal of Geographical Information Science},
+  volume={37},
+  number={12},
+  pages={2538--2574},
+  year={2023},
+  publisher={Taylor \& Francis}
+}
 ```
 
-2. Create a virtual environment (recommended):
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+## Requirements
+
+LSTM-TrajGAN uses the following packages with Python 3.6.3
+
+- numpy==1.18.4
+- pandas==1.1.5
+- tensorflow-gpu==1.13.1
+- Keras==2.2.4
+- geohash2==1.1
+- scikit-learn==0.23.2
+
+## Usage
+
+### Data Encoding
+<p align="center">
+    <img src="results/Trajectory_Point_Encoding.png" alt="Trajectory_Point_Encoding" >
+</p>
+
+Convert csv files to one-hot-encoded npy files.
+
+```
+python data/csv2npy.py --load_path dev_train_encoded_final.csv --save_path train_encoded.npy --tid_col tid
 ```
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
+Where `load_path` is the path to csv file, `save_path` is the path to save npy file, `tid_col` is the column name of trajectory id.
+
+### Training
+
+Train the LSTM-TrajGAN model using the preprocessed data.
+
+```
+python train.py 2000 256 100
 ```
 
-## Data Preparation
+Where `2000` is the total training epochs, `256` is the batch size, `100` is the parameter saving interval (i.e., save params every 100 epochs).
 
-1. Place your raw trajectory data in `data/raw_data.npy`
-   - The data should be a numpy array with shape (N, T, F)
-   - N: number of trajectories
-   - T: maximum sequence length
-   - F: number of features (latitude, longitude, day, hour, category)
+### Prediction
 
-2. Configure data parameters in `configs/config.yaml`:
-```yaml
-data:
-  max_length: 24
-  lat_centroid: 39.9042
-  lon_centroid: 116.4074
-  scale_factor: 1000
+Generate synthetic trajectory data based on the real test trajectory data and save them to `results/syn_traj_test.csv`.
+
+```
+python predict.py 1900
 ```
 
-## Model Configuration
+Where `1900` means we load the params file saved at the 1900th epoch to generate synthetic trajectory data.
 
-Adjust model parameters in `configs/config.yaml`:
+### Test
 
-```yaml
-model:
-  latent_dim: 64
-  num_heads: 8
-  num_transformer_blocks: 6
-  dff: 256
-  dropout_rate: 0.1
+Evaluate the synthetic trajectory data on the Trajectory-User Linking task using MARC.
+
+```
+python TUL_test.py data/train_latlon.csv results/syn_traj_test.csv 100
 ```
 
-## Training Configuration
+Where `data/train_latlon.csv` is the training data, `results/syn_traj_test.csv` is the synthetic test data, `100` is the embedder size.
 
-Configure training parameters in `configs/config.yaml`:
+### Dataset
 
-```yaml
-training:
-  batch_size: 32
-  epochs: 100
-  learning_rate: 0.0001
-  reward_weights:
-    privacy: 0.4
-    utility: 0.3
-    adversarial: 0.3
-  ppo:
-    gamma: 0.99
-    gae_lambda: 0.95
-    clip_epsilon: 0.2
-    c1: 1.0
-    c2: 0.01
-```
+The data we used in our paper originally come from [the Foursquare NYC check-in dataset](https://sites.google.com/site/yangdingqi/home/foursquare-dataset).
 
-## Running the Experiment
+### References
 
-1. Start training:
-```bash
-python main.py
-```
+We mainly referred to these two works:
 
-2. Monitor training progress:
-   - Training metrics will be printed to console
-   - Model checkpoints will be saved in `results/checkpoints/`
-   - Training history will be saved in `results/training_history.npy`
+*May Petry, L., Leite Da Silva, C., Esuli, A., Renso, C., and Bogorny, V. (2020). MARC: a robust method for multiple-aspect trajectory classification via space, time, and semantic embeddings. International Journal of Geographical Information Science, 34(7), 1428-1450.* [Github](https://github.com/bigdata-ufsc/petry-2020-marc)
 
-3. View results:
-   - Evaluation metrics will be saved in `results/evaluation_metrics.npy`
-   - Generated trajectories will be saved in `results/generated_trajectories.npy`
-
-## Evaluation Metrics
-
-The model is evaluated using:
-
-### Privacy Metrics
-- ACC@1: Top-1 accuracy of TUL classifier
-- ACC@5: Top-5 accuracy of TUL classifier
-- Macro Precision, Recall, and F1
-
-### Utility Metrics
-- FID (Fréchet Inception Distance)
-- JSD (Jensen-Shannon Divergence) for each feature
-
-## Ablation Study
-
-To run ablation studies with different reward weight combinations:
-
-```python
-from src.training.trainer import PPOTrainer
-from src.evaluation.privacy import evaluate_privacy
-from src.evaluation.utility import evaluate_utility
-
-# Define different weight combinations
-weight_combinations = [
-    {'privacy': 0.5, 'utility': 0.3, 'adversarial': 0.2},
-    {'privacy': 0.3, 'utility': 0.5, 'adversarial': 0.2},
-    {'privacy': 0.3, 'utility': 0.3, 'adversarial': 0.4}
-]
-
-# Run experiments for each combination
-for weights in weight_combinations:
-    trainer = PPOTrainer(model, train_dataset, val_dataset, tul_classifier, weights)
-    trainer.train(epochs=100)
-    
-    # Evaluate
-    privacy_metrics = evaluate_privacy(model, test_data, tul_classifier)
-    utility_metrics = evaluate_utility(model, test_data)
-    
-    # Save results
-    save_results(weights, privacy_metrics, utility_metrics)
-```
-
-## Results Analysis
-
-1. Load evaluation metrics:
-```python
-metrics = np.load('results/evaluation_metrics.npy', allow_pickle=True).item()
-```
-
-2. Plot results:
-```python
-plot_results(metrics)
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+*Keras-GAN: Collection of Keras implementations of Generative Adversarial Networks (GANs).* [Github](https://github.com/eriklindernoren/Keras-GAN)
