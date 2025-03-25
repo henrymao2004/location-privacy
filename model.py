@@ -1,72 +1,71 @@
-import tensorflow as tf
-import keras
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import random
 from rl_components import CriticNetwork, RewardFunction, PPOAgent
 
 random.seed(2020)
 np.random.seed(2020)
-tf.random.set_random_seed(2020)
+torch.manual_seed(2020)
 
-from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, LayerNormalization, MultiHeadAttention, Dropout
-from keras.initializers import he_uniform
-from keras.regularizers import l1
-
-from keras.models import Sequential, Model
-from keras.optimizers import Adam
-from keras.preprocessing.sequence import pad_sequences
-
-from losses import d_bce_loss, trajLoss
-
-class TransformerBlock(tf.keras.layers.Layer):
+class TransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
         super(TransformerBlock, self).__init__()
         
-        self.att = MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
-        self.ffn = Sequential([
-            Dense(ff_dim, activation="relu"),
-            Dense(embed_dim),
-        ])
+        self.att = nn.MultiheadAttention(embed_dim, num_heads, dropout=rate)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, ff_dim),
+            nn.ReLU(),
+            nn.Linear(ff_dim, embed_dim)
+        )
         
-        self.layernorm1 = LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = LayerNormalization(epsilon=1e-6)
-        self.dropout1 = Dropout(rate)
-        self.dropout2 = Dropout(rate)
+        self.layernorm1 = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.layernorm2 = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.dropout1 = nn.Dropout(rate)
+        self.dropout2 = nn.Dropout(rate)
         
-    def call(self, inputs, training=False):
-        attn_output = self.att(inputs, inputs)
-        attn_output = self.dropout1(attn_output, training=training)
-        out1 = self.layernorm1(inputs + attn_output)
-        ffn_output = self.ffn(out1)
-        ffn_output = self.dropout2(ffn_output, training=training)
-        return self.layernorm2(out1 + ffn_output)
+    def forward(self, x):
+        # Reshape for MultiheadAttention
+        x = x.permute(0, 2, 1)  # [batch_size, seq_len, embed_dim] -> [batch_size, embed_dim, seq_len]
+        
+        # Self-attention
+        attn_output, _ = self.att(x, x, x)
+        attn_output = self.dropout1(attn_output)
+        x = self.layernorm1(x + attn_output)
+        
+        # Feed-forward
+        ffn_output = self.ffn(x)
+        ffn_output = self.dropout2(ffn_output)
+        x = self.layernorm2(x + ffn_output)
+        
+        # Reshape back
+        x = x.permute(0, 2, 1)  # [batch_size, embed_dim, seq_len] -> [batch_size, seq_len, embed_dim]
+        return x
 
-class LSTM_TrajGAN():
+class TrajGAN(nn.Module):
     def __init__(self, latent_dim, keys, vocab_size, max_length, lat_centroid, lon_centroid, scale_factor, tul_classifier=None):
+        super(TrajGAN, self).__init__()
         self.latent_dim = latent_dim
         self.max_length = max_length
-        
         self.keys = keys
         self.vocab_size = vocab_size
-        
         self.lat_centroid = lat_centroid
         self.lon_centroid = lon_centroid
         self.scale_factor = scale_factor
-        
         self.x_train = None
         
         # Define the optimizer
-        self.optimizer = Adam(0.001, 0.5)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001, betas=(0.5, 0.999))
 
         # Build the trajectory generator
         self.generator = self.build_generator()
 
         # Build and compile the discriminator
         self.discriminator = self.build_discriminator()
-        self.discriminator.compile(loss=d_bce_loss(gen_trajs[4]), optimizer=self.optimizer, metrics=['accuracy'])
 
         # Build the critic network for RL
-        self.critic = CriticNetwork(max_length, vocab_size).model
+        self.critic = CriticNetwork(max_length, vocab_size)
         
         # Initialize reward function with TUL classifier
         self.reward_function = RewardFunction(self.discriminator, tul_classifier)
@@ -74,193 +73,207 @@ class LSTM_TrajGAN():
         # Initialize PPO agent
         self.ppo_agent = PPOAgent(self.generator, self.critic, self.reward_function)
 
-        # The combined model only trains the trajectory generator
-        self.discriminator.trainable = False
-
-        # The discriminator takes generated trajectories as input and makes predictions
-        pred = self.discriminator(gen_trajs[:4])
-
-        # The combined model (combining the generator and the discriminator)
-        self.combined = Model(inputs=inputs, outputs=pred)
-        self.combined.compile(loss=trajLoss(inputs, gen_trajs), optimizer=self.optimizer)
-        
-        # Save model architectures
-        C_model_json = self.combined.to_json()
-        with open("params/C_model.json", "w") as json_file:
-            json_file.write(C_model_json)
-            
-        G_model_json = self.generator.to_json()
-        with open("params/G_model.json", "w") as json_file:
-            json_file.write(G_model_json)
-        
-        D_model_json = self.discriminator.to_json()
-        with open("params/D_model.json", "w") as json_file:
-            json_file.write(D_model_json)
-            
-        Critic_model_json = self.critic.to_json()
-        with open("params/Critic_model.json", "w") as json_file:
-            json_file.write(Critic_model_json)
-
     def build_discriminator(self):
-        # Input Layer
-        inputs = []
-        
-        # Embedding Layer
-        embeddings = []
-        for idx, key in enumerate(self.keys):
-            if key == 'mask':
-                continue
-            if key == 'lat_lon':
-                i = Input(shape=(self.max_length, self.vocab_size[key]),
-                          name='input_' + key)
-
-                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=64, use_bias=True, activation='relu', kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_latlon = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
-
-            else:
-                i = Input(shape=(self.max_length,self.vocab_size[key]), name='input_' + key)
-                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=self.vocab_size[key], use_bias=True, activation='relu', kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_attr = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
-            inputs.append(i)
-            embeddings.append(e)
+        class Discriminator(nn.Module):
+            def __init__(self, max_length, vocab_size, keys):
+                super(Discriminator, self).__init__()
+                self.max_length = max_length
+                self.vocab_size = vocab_size
+                self.keys = keys
+                
+                # Embedding layers
+                self.embeddings = nn.ModuleDict()
+                for key in keys:
+                    if key == 'mask':
+                        continue
+                    if key == 'lat_lon':
+                        self.embeddings[key] = nn.Linear(vocab_size[key], 64)
+                    else:
+                        self.embeddings[key] = nn.Linear(vocab_size[key], vocab_size[key])
+                
+                # Feature fusion
+                self.fusion = nn.Linear(sum(vocab_size.values()), 100)
+                
+                # Transformer
+                self.transformer = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)
+                
+                # Output
+                self.output = nn.Linear(100, 1)
+                self.sigmoid = nn.Sigmoid()
             
-        # Feature Fusion Layer
-        concat_input = Concatenate(axis=2)(embeddings)
-        unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(concat_input)
-        d = Dense(units=100, use_bias=True, activation='relu', kernel_initializer=he_uniform(seed=1), name='emb_trajpoint')
-        dense_outputs = [d(x) for x in unstacked]
-        emb_traj = Lambda(lambda x: tf.stack(x, axis=1))(dense_outputs)
+            def forward(self, inputs):
+                # Process each input type
+                embeddings = []
+                for idx, key in enumerate(self.keys):
+                    if key == 'mask':
+                        continue
+                    x = inputs[idx]
+                    if key == 'lat_lon':
+                        x = self.embeddings[key](x)
+                    else:
+                        x = self.embeddings[key](x)
+                    embeddings.append(x)
+                
+                # Concatenate embeddings
+                x = torch.cat(embeddings, dim=-1)
+                x = self.fusion(x)
+                
+                # Transformer
+                x = self.transformer(x)
+                
+                # Global average pooling
+                x = torch.mean(x, dim=1)
+                
+                # Output
+                x = self.output(x)
+                x = self.sigmoid(x)
+                return x
         
-        # Transformer Modeling Layer
-        transformer_block = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)
-        transformer_output = transformer_block(emb_traj)
-        
-        # Global average pooling to reduce sequence dimension
-        avg_pool = tf.keras.layers.GlobalAveragePooling1D()(transformer_output)
-        
-        # Output
-        sigmoid = Dense(1, activation='sigmoid')(avg_pool)
-
-        return Model(inputs=inputs, outputs=sigmoid)
+        return Discriminator(self.max_length, self.vocab_size, self.keys)
 
     def build_generator(self):
-        # Input Layer
-        inputs = []
-        
-        # Embedding Layer
-        embeddings = []
-        noise = Input(shape=(self.latent_dim,), name='input_noise')
-        mask = Input(shape=(self.max_length, 1), name='input_mask')
-        for idx, key in enumerate(self.keys):
-            if key == 'mask':
-                inputs.append(mask)
-                continue
-            elif key == 'lat_lon':
-                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
-                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=64, activation='relu', use_bias=True, kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_latlon = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
-            else:
-                i = Input(shape=(self.max_length,self.vocab_size[key]), name='input_' + key)
-                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=self.vocab_size[key], activation='relu', use_bias=True, kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_attr = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
-            inputs.append(i)
-            embeddings.append(e)
-        inputs.append(noise)
-        
-        # Feature Fusion Layer
-        concat_input = Concatenate(axis=2)(embeddings)
-        unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(concat_input)
-        d = Dense(units=100, use_bias=True, activation='relu', kernel_initializer=he_uniform(seed=1), name='emb_trajpoint')
-        dense_outputs = [d(Concatenate(axis=1)([x, noise])) for x in unstacked]
-        emb_traj = Lambda(lambda x: tf.stack(x, axis=1))(dense_outputs)
-        
-        # Transformer Modeling Layer
-        transformer_block = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)
-        transformer_output = transformer_block(emb_traj)
-        
-        # Outputs
-        outputs = []
-        for idx, key in enumerate(self.keys):
-            if key == 'mask':
-                output_mask = Lambda(lambda x: x)(mask)
-                outputs.append(output_mask)
-            elif key == 'lat_lon':
-                output = TimeDistributed(Dense(2, activation='tanh'), name='output_latlon')(transformer_output)
-                scale_factor = self.scale_factor
-                output_stratched = Lambda(lambda x: x * scale_factor)(output)
-                outputs.append(output_stratched)
-            else:
-                output = TimeDistributed(Dense(self.vocab_size[key], activation='softmax'), name='output_' + key)(transformer_output)
-                outputs.append(output)
+        class Generator(nn.Module):
+            def __init__(self, max_length, vocab_size, keys, latent_dim, scale_factor):
+                super(Generator, self).__init__()
+                self.max_length = max_length
+                self.vocab_size = vocab_size
+                self.keys = keys
+                self.latent_dim = latent_dim
+                self.scale_factor = scale_factor
                 
-        return Model(inputs=inputs, outputs=outputs)
+                # Embedding layers
+                self.embeddings = nn.ModuleDict()
+                for key in keys:
+                    if key == 'mask':
+                        continue
+                    if key == 'lat_lon':
+                        self.embeddings[key] = nn.Linear(vocab_size[key], 64)
+                    else:
+                        self.embeddings[key] = nn.Linear(vocab_size[key], vocab_size[key])
+                
+                # Feature fusion
+                self.fusion = nn.Linear(sum(vocab_size.values()) + latent_dim, 100)
+                
+                # Transformer
+                self.transformer = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)
+                
+                # Output layers
+                self.outputs = nn.ModuleDict()
+                for key in keys:
+                    if key == 'mask':
+                        continue
+                    if key == 'lat_lon':
+                        self.outputs[key] = nn.Linear(100, 2)
+                        self.outputs[key + '_scale'] = lambda x: x * scale_factor
+                    else:
+                        self.outputs[key] = nn.Linear(100, vocab_size[key])
+            
+            def forward(self, inputs):
+                # Process each input type
+                embeddings = []
+                noise = inputs[-1]
+                
+                for idx, key in enumerate(self.keys):
+                    if key == 'mask':
+                        embeddings.append(inputs[idx])
+                        continue
+                    x = inputs[idx]
+                    if key == 'lat_lon':
+                        x = self.embeddings[key](x)
+                    else:
+                        x = self.embeddings[key](x)
+                    embeddings.append(x)
+                
+                # Concatenate embeddings with noise
+                x = torch.cat(embeddings + [noise], dim=-1)
+                x = self.fusion(x)
+                
+                # Transformer
+                x = self.transformer(x)
+                
+                # Generate outputs
+                outputs = []
+                for key in self.keys:
+                    if key == 'mask':
+                        outputs.append(inputs[self.keys.index(key)])
+                        continue
+                    if key == 'lat_lon':
+                        x_latlon = self.outputs[key](x)
+                        x_latlon = self.outputs[key + '_scale'](x_latlon)
+                        outputs.append(x_latlon)
+                    else:
+                        x_attr = self.outputs[key](x)
+                        x_attr = F.softmax(x_attr, dim=-1)
+                        outputs.append(x_attr)
+                
+                return outputs
+        
+        return Generator(self.max_length, self.vocab_size, self.keys, self.latent_dim, self.scale_factor)
 
     def train(self, epochs=200, batch_size=256, sample_interval=10, rl_update_interval=5):
         # Training data
-        x_train = np.load('data/final_train.npy',allow_pickle=True)
+        x_train = np.load('data/final_train.npy', allow_pickle=True)
         self.x_train = x_train
 
         # Padding zero to reach the maxlength
-        X_train = [pad_sequences(f, self.max_length, padding='pre', dtype='float64') for f in x_train]
+        X_train = [torch.tensor(pad_sequences(f, self.max_length, padding='pre', dtype='float64')) for f in x_train]
         self.X_train = X_train
         
-        for epoch in range(1,epochs+1):
+        for epoch in range(1, epochs+1):
             # Select a random batch of real trajectories
             idx = np.random.randint(0, X_train[0].shape[0], batch_size)
             
             # Ground truths for real trajectories and synthetic trajectories
-            real_bc = np.ones((batch_size, 1))
-            syn_bc = np.zeros((batch_size, 1))
+            real_bc = torch.ones((batch_size, 1))
+            syn_bc = torch.zeros((batch_size, 1))
 
             real_trajs_bc = []
-            real_trajs_bc.append(X_train[0][idx]) # latlon
-            real_trajs_bc.append(X_train[1][idx]) # day
-            real_trajs_bc.append(X_train[2][idx]) # hour
-            real_trajs_bc.append(X_train[3][idx]) # category
-            real_trajs_bc.append(X_train[4][idx]) # mask
-            noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
-            real_trajs_bc.append(noise) # noise
+            real_trajs_bc.append(X_train[0][idx])  # latlon
+            real_trajs_bc.append(X_train[1][idx])  # day
+            real_trajs_bc.append(X_train[2][idx])  # hour
+            real_trajs_bc.append(X_train[3][idx])  # category
+            real_trajs_bc.append(X_train[4][idx])  # mask
+            noise = torch.randn(batch_size, self.latent_dim)
+            real_trajs_bc.append(noise)  # noise
 
             # Generate a batch of synthetic trajectories
-            gen_trajs_bc = self.generator.predict(real_trajs_bc)
+            gen_trajs_bc = self.generator(real_trajs_bc)
 
             # Train the discriminator
-            d_loss_real = self.discriminator.train_on_batch(real_trajs_bc[:4], real_bc)
-            d_loss_syn = self.discriminator.train_on_batch(gen_trajs_bc[:4], syn_bc)
-            d_loss = 0.5 * np.add(d_loss_real, d_loss_syn)
+            self.discriminator.optimizer.zero_grad()
+            d_loss_real = F.binary_cross_entropy(self.discriminator(real_trajs_bc[:4]), real_bc)
+            d_loss_syn = F.binary_cross_entropy(self.discriminator(gen_trajs_bc[:4]), syn_bc)
+            d_loss = 0.5 * (d_loss_real + d_loss_syn)
+            d_loss.backward()
+            self.discriminator.optimizer.step()
 
             # Train the generator with GAN objective
-            noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+            self.generator.optimizer.zero_grad()
+            noise = torch.randn(batch_size, self.latent_dim)
             real_trajs_bc[5] = noise
-            g_loss = self.combined.train_on_batch(real_trajs_bc, real_bc)
+            g_loss = self.combined_loss(real_trajs_bc, gen_trajs_bc)
+            g_loss.backward()
+            self.generator.optimizer.step()
             
             # RL updates every rl_update_interval epochs
             if epoch % rl_update_interval == 0:
                 # Get current policy probabilities
-                old_probs = self.generator.predict(real_trajs_bc)
+                old_probs = self.generator(real_trajs_bc)
                 
                 # Generate trajectories and compute rewards
-                gen_trajs = self.generator.predict(real_trajs_bc)
+                gen_trajs = self.generator(real_trajs_bc)
                 rewards = []
                 for i in range(batch_size):
                     reward = self.reward_function.compute_total_reward(
-                        [t[i] for t in gen_trajs], 
-                        [t[i] for t in real_trajs_bc[:4]], 
+                        [t[i].detach().numpy() for t in gen_trajs], 
+                        [t[i].detach().numpy() for t in real_trajs_bc[:4]], 
                         idx[i]  # User ID for privacy reward
                     )
                     rewards.append(reward)
-                rewards = np.array(rewards)
+                rewards = torch.tensor(rewards)
                 
                 # Get value estimates from critic
-                values = self.critic.predict(gen_trajs)
+                values = self.critic(gen_trajs)
                 
                 # Compute advantages
                 advantages = self.ppo_agent.compute_advantages(values, rewards)
@@ -269,20 +282,55 @@ class LSTM_TrajGAN():
                 ppo_loss = self.ppo_agent.update_policy(real_trajs_bc, gen_trajs, old_probs, advantages)
                 
                 # Update critic
-                critic_loss = self.critic.train_on_batch(gen_trajs, rewards)
+                critic_loss = F.mse_loss(self.critic(gen_trajs), rewards)
+                self.critic.optimizer.zero_grad()
+                critic_loss.backward()
+                self.critic.optimizer.step()
                 
-                print(f"[{epoch}/{epochs}] D Loss: {d_loss[0]:.4f} | G Loss: {g_loss:.4f} | PPO Loss: {ppo_loss:.4f} | Critic Loss: {critic_loss:.4f}")
+                print(f"[{epoch}/{epochs}] D Loss: {d_loss.item():.4f} | G Loss: {g_loss.item():.4f} | PPO Loss: {ppo_loss:.4f} | Critic Loss: {critic_loss.item():.4f}")
             else:
-                print(f"[{epoch}/{epochs}] D Loss: {d_loss[0]:.4f} | G Loss: {g_loss:.4f}")
+                print(f"[{epoch}/{epochs}] D Loss: {d_loss.item():.4f} | G Loss: {g_loss.item():.4f}")
 
             # Print and save the losses/params
             if epoch % sample_interval == 0:
                 self.save_checkpoint(epoch)
                 print('Model params saved to the disk.')
 
+    def combined_loss(self, real_trajs, gen_trajs):
+        # Implement the combined loss function from losses.py
+        traj_length = torch.sum(real_trajs[4], dim=1)
+        
+        # BCE loss
+        bce_loss = F.binary_cross_entropy(self.discriminator(gen_trajs[:4]), torch.ones_like(self.discriminator(gen_trajs[:4])))
+        
+        # Spatial loss (L2 distance)
+        masked_latlon_full = torch.sum(torch.sum(
+            torch.multiply(
+                torch.multiply(
+                    (gen_trajs[0] - real_trajs[0]),
+                    (gen_trajs[0] - real_trajs[0])
+                ),
+                torch.cat([real_trajs[4] for _ in range(2)], dim=2)
+            ),
+            dim=1
+        ), dim=1, keepdim=True)
+        masked_latlon_mse = torch.sum(torch.div(masked_latlon_full, traj_length))
+        
+        # Categorical losses
+        ce_category = F.cross_entropy(gen_trajs[1], torch.argmax(real_trajs[1], dim=-1))
+        ce_day = F.cross_entropy(gen_trajs[2], torch.argmax(real_trajs[2], dim=-1))
+        ce_hour = F.cross_entropy(gen_trajs[3], torch.argmax(real_trajs[3], dim=-1))
+        
+        # Combine losses with weights
+        p_bce, p_latlon, p_cat, p_day, p_hour = 1, 10, 1, 1, 1
+        return (bce_loss * p_bce + 
+                masked_latlon_mse * p_latlon + 
+                ce_category * p_cat + 
+                ce_day * p_day + 
+                ce_hour * p_hour)
+
     def save_checkpoint(self, epoch):
         # Save weights
-        self.generator.save_weights(f"params/G_model_{epoch}.h5")
-        self.discriminator.save_weights(f"params/D_model_{epoch}.h5")
-        self.combined.save_weights(f"params/C_model_{epoch}.h5")
-        self.critic.save_weights(f"params/Critic_model_{epoch}.h5")
+        torch.save(self.generator.state_dict(), f"params/G_model_{epoch}.pt")
+        torch.save(self.discriminator.state_dict(), f"params/D_model_{epoch}.pt")
+        torch.save(self.critic.state_dict(), f"params/Critic_model_{epoch}.pt")
