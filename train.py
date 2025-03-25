@@ -1,14 +1,13 @@
 import sys
 import pandas as pd
 import numpy as np
-import tensorflow as tf
-
-from model import LSTM_TrajGAN
+import torch
+from model import TrajGAN
 from tul_classifier import TULClassifier
 
 # Set random seeds for reproducibility
 np.random.seed(2020)
-tf.random.set_random_seed(2020)
+torch.manual_seed(2020)
 
 if __name__ == '__main__':
     n_epochs = int(sys.argv[1])
@@ -57,9 +56,9 @@ if __name__ == '__main__':
     labels = np.ones(len(users))  # Create positive samples
     tul_classifier.train(trajectories, users, labels, epochs=10)
     
-    # Initialize LSTM-TrajGAN with RL components
-    print("Initializing LSTM-TrajGAN with RL components...")
-    gan = LSTM_TrajGAN(
+    # Initialize TrajGAN with RL components
+    print("Initializing TrajGAN with RL components...")
+    gan = TrajGAN(
         latent_dim=latent_dim,
         keys=keys,
         vocab_size=vocab_size,

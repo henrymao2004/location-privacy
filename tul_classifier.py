@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from model import TransformerBlock
+from transformer import TransformerBlock
 
 class TULClassifier(nn.Module):
     def __init__(self, max_length, vocab_size, num_users):
