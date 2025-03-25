@@ -29,27 +29,35 @@ def evaluate_utility(model, test_data):
     
     # Generate synthetic trajectories
     with torch.no_grad():
+        # Convert test data to tensors and move to device
+        real_tensors = {k: torch.stack([torch.from_numpy(t[k]).float() for t in test_data]).to(model.device) 
+                       for k in test_data[0].keys()}
+        
+        # Generate synthetic data
         noise = torch.randn(len(test_data), model.latent_dim, device=model.device)
-        gen_trajs = model.generator([*test_data[:4], test_data[4], noise])
+        syn_tensors = model.generator(noise)
         
         # Get features from discriminator
-        real_features = model.discriminator.get_features(test_data)
-        gen_features = model.discriminator.get_features(gen_trajs)
+        real_features = model.discriminator.get_features(real_tensors)
+        syn_features = model.discriminator.get_features(syn_tensors)
         
         # Convert to numpy for metric computation
         real_features = real_features.cpu().numpy()
-        gen_features = gen_features.cpu().numpy()
+        syn_features = syn_features.cpu().numpy()
+        
+        # Convert synthetic tensors to numpy for JSD computation
+        syn_data = {k: v.cpu().numpy() for k, v in syn_tensors.items()}
     
     metrics = {}
     
     # FID Score
-    metrics['fid'] = compute_fid(real_features, gen_features)
+    metrics['fid'] = compute_fid(real_features, syn_features)
     
     # JSD for each feature
     for key in model.keys:
         if key != 'mask':
-            real_dist = np.mean(test_data[key], axis=0)
-            gen_dist = np.mean(gen_trajs[key], axis=0)
-            metrics[f'jsd_{key}'] = compute_jsd(real_dist, gen_dist)
+            real_dist = np.mean([t[key] for t in test_data], axis=0)
+            syn_dist = np.mean(syn_data[key], axis=0)
+            metrics[f'jsd_{key}'] = compute_jsd(real_dist, syn_dist)
     
     return metrics 
