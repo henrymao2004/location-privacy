@@ -1,97 +1,104 @@
-import sys
-import pandas as pd
 import numpy as np
-import torch
-from model import TrajGAN
-from tul_classifier import TULClassifier
+import os
+import pandas as pd
+from model import RL_Enhanced_Transformer_TrajGAN
+from MARC.marc import MARC
 
-# Set random seeds for reproducibility
-np.random.seed(2020)
-torch.manual_seed(2020)
-
-if __name__ == '__main__':
-    n_epochs = int(sys.argv[1])
-    n_batch_size = int(sys.argv[2])
-    n_sample_interval = int(sys.argv[3])
-    
-    latent_dim = 100
-    max_length = 48
-    
-    keys = ['lat_lon', 'day', 'hour', 'category', 'mask']
-    vocab_size = {
-        'lat_lon': 2,  # latitude and longitude
-        'day': 7,      # days of week
-        'hour': 24,    # hours in day
-        'category': 9, # POI categories
-        'mask': 1      # mask for variable length
-    }
-    
+def compute_data_stats():
+    """Compute statistics from training data."""
+    # Load training data
     tr = pd.read_csv('data/train_latlon.csv')
     te = pd.read_csv('data/test_latlon.csv')
     
+    # Compute centroids
     lat_centroid = (tr['lat'].sum() + te['lat'].sum())/(len(tr)+len(te))
     lon_centroid = (tr['lon'].sum() + te['lon'].sum())/(len(tr)+len(te))
     
-    scale_factor=max(max(abs(tr['lat'].max() - lat_centroid),
-                         abs(te['lat'].max() - lat_centroid),
-                         abs(tr['lat'].min() - lat_centroid),
-                         abs(te['lat'].min() - lat_centroid),
-                        ),
-                     max(abs(tr['lon'].max() - lon_centroid),
-                         abs(te['lon'].max() - lon_centroid),
-                         abs(tr['lon'].min() - lon_centroid),
-                         abs(te['lon'].min() - lon_centroid),
-                        ))
+    # Compute scale factor
+    scale_factor = max(
+        max(abs(tr['lat'].max() - lat_centroid),
+            abs(te['lat'].max() - lat_centroid),
+            abs(tr['lat'].min() - lat_centroid),
+            abs(te['lat'].min() - lat_centroid)),
+        max(abs(tr['lon'].max() - lon_centroid),
+            abs(te['lon'].max() - lon_centroid),
+            abs(tr['lon'].min() - lon_centroid),
+            abs(te['lon'].min() - lon_centroid))
+    )
     
-    # Initialize TUL classifier
-    print("Initializing TUL classifier...")
-    # Load training data
-    train_data = np.load('data/final_train.npy', allow_pickle=True)
+    # Load training data for category size
+    x_train = np.load('data/final_train.npy', allow_pickle=True)
+    category_size = x_train[3].shape[-1]  # Get category vocabulary size
     
-    # Get user IDs from the last element and convert to a flat list
-    user_ids = []
-    for user_array in train_data[-1]:
-        if isinstance(user_array, np.ndarray):
-            user_ids.extend(user_array.flatten().tolist())
-        else:
-            user_ids.append(user_array)
+    # Get max sequence length
+    max_length = 144  # Default value, can be adjusted based on your data
     
-    num_users = len(set(user_ids))  # Get number of unique users
-    print(f"Found {num_users} unique users")
+    # Create stats dictionary
+    stats = {
+        'lat_centroid': lat_centroid,
+        'lon_centroid': lon_centroid,
+        'scale_factor': scale_factor,
+        'category_size': category_size,
+        'max_length': max_length
+    }
     
-    tul_classifier = TULClassifier(max_length, vocab_size, num_users)
+    # Save stats
+    np.save('data/data_stats.npy', stats)
+    return stats
+
+def main():
+    # Create results directory if it doesn't exist
+    if not os.path.exists('results'):
+        os.makedirs('results')
     
-    # Train TUL classifier if needed
-    # This step can be skipped if you have a pre-trained classifier
-    print("Training TUL classifier...")
-    trajectories = train_data[0]  # First element contains trajectory data
-    users = np.array(user_ids)  # Convert to numpy array
-    labels = np.ones(len(users))  # Create positive samples
-    tul_classifier.train(trajectories, users, labels, epochs=10)
+    # Compute or load data statistics
+    if not os.path.exists('data/data_stats.npy'):
+        print("Computing data statistics...")
+        data_stats = compute_data_stats()
+    else:
+        print("Loading data statistics...")
+        data_stats = np.load('data/data_stats.npy', allow_pickle=True).item()
     
-    # Initialize TrajGAN with RL components
-    print("Initializing TrajGAN with RL components...")
-    gan = TrajGAN(
+    # Initialize model parameters
+    latent_dim = 100
+    keys = ['lat_lon', 'day', 'hour', 'category', 'mask']
+    vocab_size = {
+        'lat_lon': 2,
+        'day': 7,
+        'hour': 24,
+        'category': data_stats['category_size'],
+        'mask': 1
+    }
+    max_length = data_stats['max_length']
+    lat_centroid = data_stats['lat_centroid']
+    lon_centroid = data_stats['lon_centroid']
+    scale_factor = data_stats['scale_factor']
+    
+    # Initialize TUL classifier (MARC)
+    tul_classifier = MARC()
+    tul_classifier.load_weights('MARC/weights/marc_weights.h5')
+    
+    # Initialize and train the model
+    model = RL_Enhanced_Transformer_TrajGAN(
         latent_dim=latent_dim,
         keys=keys,
         vocab_size=vocab_size,
         max_length=max_length,
         lat_centroid=lat_centroid,
         lon_centroid=lon_centroid,
-        scale_factor=scale_factor,
-        tul_classifier=tul_classifier
+        scale_factor=scale_factor
     )
+    
+    # Set TUL classifier for reward computation
+    model.tul_classifier = tul_classifier
     
     # Training parameters
-    rl_update_interval = 5  # How often to perform RL updates
+    epochs = 200
+    batch_size = 256
+    sample_interval = 10
     
     # Train the model
-    print("Starting training...")
-    gan.train(
-        epochs=n_epochs,
-        batch_size=n_batch_size,
-        sample_interval=n_sample_interval,
-        rl_update_interval=rl_update_interval
-    )
-    
-    print("Training completed!")
+    model.train(epochs=epochs, batch_size=batch_size, sample_interval=sample_interval)
+
+if __name__ == '__main__':
+    main()
