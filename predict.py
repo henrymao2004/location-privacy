@@ -1,13 +1,23 @@
 import sys
 import pandas as pd
 import numpy as np
+import argparse
 
-from model import LSTM_TrajGAN
+from model import RL_Enhanced_Transformer_TrajGAN
 
 from keras.preprocessing.sequence import pad_sequences
 
 if __name__ == '__main__':
-    n_epochs = int(sys.argv[1])
+    parser = argparse.ArgumentParser(description='Generate synthetic trajectories')
+    parser.add_argument('--epochs', type=int, default=2000, help='Number of epochs (used only if weights_path not provided)')
+    parser.add_argument('--weights_path', type=str, default=None, help='Path to generator weights file')
+    parser.add_argument('--output_path', type=str, default='results/syn_traj_test.csv', help='Path to save synthetic trajectories')
+    
+    args = parser.parse_args()
+    
+    n_epochs = args.epochs
+    weights_path = args.weights_path
+    output_path = args.output_path
     
     latent_dim = 100
     max_length = 144
@@ -32,7 +42,7 @@ if __name__ == '__main__':
                          abs(te['lon'].min() - lon_centroid),
                         ))
     
-    gan = LSTM_TrajGAN(latent_dim, keys, vocab_size, max_length, lat_centroid, lon_centroid, scale_factor)
+    gan = RL_Enhanced_Transformer_TrajGAN(latent_dim, keys, vocab_size, max_length, lat_centroid, lon_centroid, scale_factor)
     
     # Test data
     x_test = np.load('data/final_test.npy',allow_pickle=True)
@@ -45,7 +55,13 @@ if __name__ == '__main__':
     X_test.append(noise)
     
     # Load params for the generator
-    gan.generator.load_weights('training_params/G_model_' + str(n_epochs) + '.h5') # params/G_model_2000.h5
+    if weights_path:
+        print(f"Loading generator weights from: {weights_path}")
+        gan.generator.load_weights(weights_path)
+    else:
+        default_weights = f'training_params/G_model_{n_epochs}.h5'
+        print(f"Loading generator weights from: {default_weights}")
+        gan.generator.load_weights(default_weights)
     
     # Make predictions
     prediction = gan.generator.predict(X_test)
@@ -85,7 +101,8 @@ if __name__ == '__main__':
     df_traj_fin['label'] = df_traj_fin['label'].astype(np.int32)
     
     # Save synthetic trajectory data
-    df_traj_fin.to_csv('results/syn_traj_test.csv',index=False)
+    print(f"Saving synthetic trajectories to: {output_path}")
+    df_traj_fin.to_csv(output_path, index=False)
     
     
     
