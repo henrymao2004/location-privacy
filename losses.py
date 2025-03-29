@@ -101,11 +101,11 @@ class CustomTrajLoss(Loss):
         
         # Combined loss with proper weighting
         # Clip each component to reasonable ranges
-        bce_loss_clipped = keras.ops.clip(bce_loss, 0, 10)
-        masked_latlon_mse_clipped = keras.ops.clip(masked_latlon_mse, 0, 100)
-        ce_category_mean_clipped = keras.ops.clip(ce_category_mean, 0, 10)
-        ce_day_mean_clipped = keras.ops.clip(ce_day_mean, 0, 10)
-        ce_hour_mean_clipped = keras.ops.clip(ce_hour_mean, 0, 10)
+        bce_loss_clipped = keras.ops.clip(bce_loss, 0, 1)
+        masked_latlon_mse_clipped = keras.ops.clip(masked_latlon_mse, 0, 5)
+        ce_category_mean_clipped = keras.ops.clip(ce_category_mean, 0, 1)
+        ce_day_mean_clipped = keras.ops.clip(ce_day_mean, 0, 1)
+        ce_hour_mean_clipped = keras.ops.clip(ce_hour_mean, 0, 1)
         
         # Use reduced weights for a more stable start
         p_bce = tf.constant(self.p_bce, dtype=tf.float32)
@@ -121,7 +121,7 @@ class CustomTrajLoss(Loss):
                      p_hour * ce_hour_mean_clipped)
         
         # Final safety clipping to prevent numerical instability
-        total_loss = keras.ops.clip(total_loss, 0, 1000)
+        total_loss = keras.ops.clip(total_loss, 0, 10)
         
         # Debug output
         tf.print("Loss components - BCE:", bce_loss_clipped, 
