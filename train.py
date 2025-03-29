@@ -121,138 +121,170 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
             "early_stopping_patience": early_stopping.patience
         })
     
-    # Training data
-    x_train = np.load('data/final_train.npy', allow_pickle=True)
-    self.x_train = x_train
-    
-    # Padding
-    X_train = [pad_sequences(f, self.max_length, padding='pre', dtype='float64') 
-              for f in x_train]
-    self.X_train = X_train
-    
-    # Check if we need to rebuild the model with correct input shapes
-    needs_rebuild = False
-    actual_shapes = {}
-    
-    for i, key in enumerate(self.keys):
-        if key != 'mask':
-            actual_shape = X_train[i].shape
-            print(f"Data shape for {key}: {actual_shape}")
-            if key == 'category' and actual_shape[2] != self.vocab_size[key]:
-                print(f"Mismatch for {key}: expected {self.vocab_size[key]}, got {actual_shape[2]}")
-                self.vocab_size[key] = actual_shape[2]
-                needs_rebuild = True
-            actual_shapes[key] = actual_shape[2]
-    
-    # Rebuild the model if needed
-    if needs_rebuild:
-        print("Rebuilding model with correct input shapes...")
-        # Save optimizer state
-        optimizer_weights = None
-        if hasattr(self, 'actor_optimizer') and hasattr(self.actor_optimizer, 'get_weights'):
-            optimizer_weights = self.actor_optimizer.get_weights()
+    try:
+        # Training data
+        x_train = np.load('data/final_train.npy', allow_pickle=True)
+        self.x_train = x_train
         
-        # Rebuild models
-        self.generator = self.build_generator()
-        self.critic = self.build_critic()
-        self.discriminator = self.build_discriminator()
+        # Padding
+        X_train = [pad_sequences(f, self.max_length, padding='pre', dtype='float64') 
+                  for f in x_train]
+        self.X_train = X_train
         
-        # Compile models
-        self.discriminator.compile(loss='binary_crossentropy', optimizer=self.discriminator_optimizer)
-        self.critic.compile(loss='mse', optimizer=self.critic_optimizer)
+        # Check if we need to rebuild the model with correct input shapes
+        needs_rebuild = False
+        actual_shapes = {}
         
-        self.setup_combined_model()
-        # Restore optimizer state if available
-        if optimizer_weights is not None:
-            self.actor_optimizer.set_weights(optimizer_weights)
+        for i, key in enumerate(self.keys):
+            if key != 'mask':
+                actual_shape = X_train[i].shape
+                print(f"Data shape for {key}: {actual_shape}")
+                if key == 'category' and actual_shape[2] != self.vocab_size[key]:
+                    print(f"Mismatch for {key}: expected {self.vocab_size[key]}, got {actual_shape[2]}")
+                    self.vocab_size[key] = actual_shape[2]
+                    needs_rebuild = True
+                actual_shapes[key] = actual_shape[2]
         
-        print("Model rebuilt successfully!")
-    
-    # Training loop
-    print(f"Starting training for {epochs} epochs with early stopping (patience={early_stopping.patience})...")
-    for epoch in range(epochs):
-        # Sample batch
-        idx = np.random.randint(0, len(X_train[0]), batch_size)
-        batch = [X[idx] for X in X_train]
-        
-        # Training step
-        metrics = self.train_step(batch, batch_size)
-        
-        # Log metrics to WandB
-        if self.wandb:
-            wandb_metrics = {
-                "epoch": epoch,
-                "d_loss_real": metrics['d_loss_real'],
-                "d_loss_fake": metrics['d_loss_fake'],
-                "g_loss": metrics['g_loss'],
-                "c_loss": metrics['c_loss']
-            }
+        # Rebuild the model if needed
+        if needs_rebuild:
+            print("Rebuilding model with correct input shapes...")
+            # Save optimizer state
+            optimizer_weights = None
+            if hasattr(self, 'actor_optimizer') and hasattr(self.actor_optimizer, 'get_weights'):
+                optimizer_weights = self.actor_optimizer.get_weights()
             
-            # Calculate combined D loss for tracking
-            d_loss_combined = (metrics['d_loss_real'] + metrics['d_loss_fake']) / 2
-            wandb_metrics["d_loss_combined"] = d_loss_combined
+            # Rebuild models
+            self.generator = self.build_generator()
+            self.critic = self.build_critic()
+            self.discriminator = self.build_discriminator()
             
-            # Add any available reward metrics
-            if 'reward' in metrics:
-                wandb_metrics["reward"] = metrics['reward']
+            # Compile models
+            self.discriminator.compile(loss='binary_crossentropy', optimizer=self.discriminator_optimizer)
+            self.critic.compile(loss='mse', optimizer=self.critic_optimizer)
+            
+            self.setup_combined_model()
+            # Restore optimizer state if available
+            if optimizer_weights is not None:
+                self.actor_optimizer.set_weights(optimizer_weights)
+            
+            print("Model rebuilt successfully!")
+        
+        # Training loop
+        print(f"Starting training for {epochs} epochs with early stopping (patience={early_stopping.patience})...")
+        
+        # Stats for tracking
+        best_reward = float('-inf')
+        best_epoch = 0
+        mean_reward_history = []
+        
+        for epoch in range(epochs):
+            # Get random batch for training
+            try:
+                batch_indices = np.random.randint(0, len(X_train[0]), batch_size)
+                batch = [X[batch_indices] for X in X_train]
+                
+                # Training step with error handling
+                metrics = self.train_step(batch, batch_size)
+                
+                if epoch % sample_interval == 0:
+                    print(f"Epoch {epoch}/{epochs}")
+                    print(f"D_loss_real: {metrics['d_loss_real']:.4f}, D_loss_fake: {metrics['d_loss_fake']:.4f}")
+                    print(f"G_loss: {metrics['g_loss']:.4f}, C_loss: {metrics['c_loss']:.4f}")
+                    print(f"Mean reward: {metrics['reward']:.4f}")
+                    
+                    if self.wandb:
+                        # Log metrics to wandb
+                        wandb_metrics = {
+                            "epoch": epoch,
+                            "d_loss_real": metrics['d_loss_real'],
+                            "d_loss_fake": metrics['d_loss_fake'],
+                            "g_loss": metrics['g_loss'],
+                            "c_loss": metrics['c_loss'],
+                            "reward": metrics['reward']
+                        }
+                        
+                        self.wandb.log(wandb_metrics)
+                    
+                    # Generate and visualize sample trajectories
+                    if hasattr(self, 'sample_trajectories_for_wandb'):
+                        self.sample_trajectories_for_wandb(epoch)
+                
+                # Track early stopping
+                improved = early_stopping.on_epoch_end(epoch, metrics)
+                
+                # Save the model periodically
+                if epoch % 50 == 0 and epoch > 0:
+                    self.save_checkpoint(epoch)
+                
+                # Save best model based on mean reward
+                mean_reward = metrics['reward']
+                mean_reward_history.append(mean_reward)
+                
+                if mean_reward > best_reward:
+                    best_reward = mean_reward
+                    best_epoch = epoch
+                    if save_best:
+                        # Save best model
+                        self.save_checkpoint(f"best_{epoch}")
                 
                 # Check for early stopping
-                should_stop = early_stopping.on_epoch_end(epoch, metrics)
-                if should_stop:
-                    print(f"Training stopped at epoch {epoch} due to early stopping.")
+                if early_stopping.should_stop:
+                    print(f"\nEarly stopping triggered after {early_stopping.wait_count} epochs without improvement")
+                    print(f"Best model was at epoch {early_stopping.best_epoch} with reward {early_stopping.best_reward:.4f}")
                     break
                 
-                # Track and save the best model based on reward
-                if save_best and metrics['reward'] > self.best_reward:
-                    self.best_reward = metrics['reward']
-                    wandb_metrics["best_reward"] = self.best_reward
-                    self.save_best_checkpoint(checkpoint_dir, f"best_reward_model")
-                    print(f"New best reward: {self.best_reward:.4f} at epoch {epoch}")
+                # Additional stopping criteria: check for NaN losses
+                if np.isnan(metrics['g_loss']) or np.isnan(metrics['d_loss_real']) or np.isnan(metrics['d_loss_fake']):
+                    print("NaN loss detected, stopping training")
+                    break
+                
+                # Check for excessive loss values that indicate instability
+                if metrics['g_loss'] > 1000 or metrics['d_loss_real'] > 1000 or metrics['d_loss_fake'] > 1000:
+                    print("High loss values detected, might indicate training instability")
+                    # Reduce learning rate if high losses are detected consistently
+                    if epoch > 10 and np.mean(mean_reward_history[-10:]) < np.mean(mean_reward_history[-20:-10]):
+                        print("Reducing learning rate to stabilize training")
+                        self.actor_optimizer.learning_rate = self.actor_optimizer.learning_rate * 0.5
+                        self.critic_optimizer.learning_rate = self.critic_optimizer.learning_rate * 0.5
+                        self.discriminator_optimizer.learning_rate = self.discriminator_optimizer.learning_rate * 0.5
+                        print(f"New learning rate: {self.actor_optimizer.learning_rate.numpy()}")
             
-            # Track and save based on generator loss
-            if save_best and metrics['g_loss'] < self.best_g_loss:
-                self.best_g_loss = metrics['g_loss']
-                wandb_metrics["best_g_loss"] = self.best_g_loss
-                self.save_best_checkpoint(checkpoint_dir, f"best_g_loss_model")
-                print(f"New best generator loss: {self.best_g_loss:.4f} at epoch {epoch}")
-            
-            # Track and save based on discriminator loss
-            if save_best and d_loss_combined < self.best_d_loss:
-                self.best_d_loss = d_loss_combined
-                wandb_metrics["best_d_loss"] = self.best_d_loss
-                self.save_best_checkpoint(checkpoint_dir, f"best_d_loss_model")
-                print(f"New best discriminator loss: {self.best_d_loss:.4f} at epoch {epoch}")
-            
-            # Log to wandb
-            self.wandb.log(wandb_metrics)
+            except Exception as e:
+                print(f"Error during epoch {epoch}: {e}")
+                import traceback
+                traceback.print_exc()
+                print("Continuing to next epoch...")
+                continue
         
-            # Generate trajectory visualizations for wandb every 50 epochs
-            if epoch % 50 == 0:
-                self.sample_trajectories_for_wandb(epoch)
+        # Save final model
+        self.save_checkpoint("final")
         
-        # Print progress
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}/{epochs}")
-            print(f"D_real: {metrics['d_loss_real']:.4f}, D_fake: {metrics['d_loss_fake']:.4f}, G: {metrics['g_loss']:.4f}, C: {metrics['c_loss']:.4f}")
-            if 'reward' in metrics:
-                print(f"Reward: {metrics['reward']:.4f}")
+        # Return best epoch and reward
+        if self.wandb:
+            self.wandb.log({
+                "training_complete": True,
+                "best_epoch": best_epoch,
+                "best_reward": best_reward
+            })
         
-        # Save checkpoints
-        if epoch % sample_interval == 0:
-            self.save_checkpoint(epoch)
+        print(f"\nTraining completed. Best model was at epoch {early_stopping.best_epoch} "
+              f"with reward {early_stopping.best_reward:.4f}")
+        
+        return early_stopping.best_epoch, early_stopping.best_reward
     
-    # Log final training summary
-    wandb.log({
-        "training_completed": True,
-        "total_epochs_trained": epoch + 1,
-        "early_stopping_best_epoch": early_stopping.best_epoch,
-        "early_stopping_best_reward": early_stopping.best_reward
-    })
-    
-    print(f"\nTraining completed. Best model was at epoch {early_stopping.best_epoch} "
-          f"with reward {early_stopping.best_reward:.4f}")
-    
-    return early_stopping.best_epoch, early_stopping.best_reward
+    except Exception as e:
+        print(f"Critical error during training: {e}")
+        import traceback
+        traceback.print_exc()
+        # Try to save a checkpoint even if training fails
+        try:
+            self.save_checkpoint("emergency_save")
+            print("Emergency checkpoint saved")
+        except:
+            print("Failed to save emergency checkpoint")
+        
+        # Return default values
+        return 0, 0.0
 
 def main():
     # Initialize wandb
@@ -261,8 +293,8 @@ def main():
         entity="xutao-henry-mao-vanderbilt-university",
         config={
             "architecture": "RL_Enhanced_Transformer_TrajGAN",
-            "epochs": 2000,
-            "batch_size": 256,
+            "epochs": 500,
+            "batch_size": 64,
             "latent_dim": 100,
             "max_length": 144,
             "rl_params": {
@@ -323,10 +355,6 @@ def main():
     lon_centroid = data_stats['lon_centroid']
     scale_factor = data_stats['scale_factor']
     
-    # Initialize TUL classifier (MARC)
-    tul_classifier = MARC()
-    tul_classifier.load_weights('/root/autodl-tmp/location-privacy/MARC/MARC_Weight.h5')
-    
     # Initialize and train the model
     model = RL_Enhanced_Transformer_TrajGAN(
         latent_dim=latent_dim,
@@ -338,16 +366,13 @@ def main():
         scale_factor=scale_factor
     )
     
-    # Set TUL classifier for reward computation
-    model.tul_classifier = tul_classifier
-    
     # Set wandb instance for the model
     model.set_wandb(wandb)
     
     # Training parameters
-    epochs = 2000
-    batch_size = 256
-    sample_interval = 10
+    epochs = 500
+    batch_size = 64
+    sample_interval = 5
     
     # Log model architecture as text
     generator_summary = []
