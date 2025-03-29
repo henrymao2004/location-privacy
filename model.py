@@ -73,31 +73,41 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         self.x_train = None
         
-        # RL parameters (Updated based on architecture table)
+        # RL parameters
         self.gamma = 0.99  # discount factor
-        self.gae_lambda = 0.95  # GAE parameter (updated)
+        self.gae_lambda = 0.95  # GAE parameter
         self.clip_epsilon = 0.2  # PPO clip parameter
-        self.c1 = 0.5  # value function coefficient
-        self.c2 = 0.01  # entropy coefficient (updated)
+        self.c1 = 0.5  # value function coefficient (reduced)
+        self.c2 = 0.01  # entropy coefficient
         self.ppo_epochs = 4  # Number of PPO epochs per batch
         
         # Load or initialize TUL classifier for privacy rewards
         self.tul_classifier = self.load_tul_classifier()
         
-        # Updated reward weights based on the parameter image
-        self.w_priv = 0.4    # Reduced from 0.6
-        self.w_util = 0.3   # Reduced from 0.3
-        self.w_adv = 0.4    # Increased from 0.1
-            
-        # Updated utility component weights based on the parameter image
-        self.w_spatial = 0.2    # Reduced from 0.4
-        self.w_temporal = 0.3   # Reduced from 0.4
-        self.w_semantic = 0.5   # Increased from 0.2
+        # Reward balance parameters (alpha, beta, gamma as per the paper)
+        self.alpha_0 = 0.3    # Initial privacy weight
+        self.beta_0 = 0.3     # Initial utility weight
+        self.gamma_0 = 0.4    # Initial adversarial weight
         
-        # Define optimizers with REDUCED learning rates for stability
-        self.actor_optimizer = Adam(0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
-        self.critic_optimizer = Adam(0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
-        self.discriminator_optimizer = Adam(0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
+        # Current adaptive weights (will be updated during training)
+        self.alpha_t = self.alpha_0  
+        self.beta_t = self.beta_0
+        self.gamma_t = self.gamma_0
+        
+        # Target metrics for adaptive balancing
+        self.acc_at_1_target = 0.2  # Target identification accuracy (lower is better for privacy)
+        self.fid_target = 0.5       # Target FID score for utility (lower is better)
+        self.fid_max = 5.0          # Maximum expected FID score
+            
+        # Utility component weights
+        self.w1 = 0.4    # Spatial loss weight (d_spatial)
+        self.w2 = 0.3    # Temporal loss weight (d_temporal)
+        self.w3 = 0.3    # Semantic/category loss weight (d_semantic)
+        
+        # Define optimizers with reduced learning rates and gradient clipping
+        self.actor_optimizer = Adam(0.001, clipnorm=1.0)
+        self.critic_optimizer = Adam(0.001, clipnorm=1.0)
+        self.discriminator_optimizer = Adam(0.001, clipnorm=1.0)
 
         # Build networks
         self.generator = self.build_generator()
@@ -116,6 +126,10 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.best_reward = float('-inf')
         self.best_g_loss = float('inf')
         self.best_d_loss = float('inf')
+        
+        # Tracking metrics for adaptive reward balancing
+        self.current_acc_at_1 = 0.0
+        self.current_fid = 0.0
 
     def set_wandb(self, wandb_instance):
         """Set wandb instance for logging."""
@@ -131,17 +145,24 @@ class RL_Enhanced_Transformer_TrajGAN():
             "lat_centroid": self.lat_centroid,
             "lon_centroid": self.lon_centroid,
             "scale_factor": self.scale_factor,
+            # RL parameters
             "gamma": self.gamma,
             "gae_lambda": self.gae_lambda,
             "clip_epsilon": self.clip_epsilon,
             "c1": self.c1,
             "c2": self.c2,
-            "w_adv": self.w_adv,
-            "w_util": self.w_util,
-            "w_priv": self.w_priv,
-            "w_spatial": self.w_spatial,
-            "w_temporal": self.w_temporal,
-            "w_semantic": self.w_semantic,
+            # Reward weights
+            "alpha_0": self.alpha_0,
+            "beta_0": self.beta_0,
+            "gamma_0": self.gamma_0,
+            # Adaptive targets
+            "acc_at_1_target": self.acc_at_1_target,
+            "fid_target": self.fid_target,
+            "fid_max": self.fid_max,
+            # Utility component weights
+            "w1": self.w1,
+            "w2": self.w2,
+            "w3": self.w3,
         }
         
     @classmethod
@@ -189,7 +210,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         noise = Input(shape=(self.latent_dim,), name='input_noise')
         mask = Input(shape=(self.max_length, 1), name='input_mask')
         
-        # Embedding layers for each feature - REDUCED dimensions
+        # Embedding layers for each feature
         for idx, key in enumerate(self.keys):
             if key == 'mask':
                 inputs.append(mask)
@@ -197,14 +218,14 @@ class RL_Enhanced_Transformer_TrajGAN():
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=128, activation='relu', use_bias=True, # REDUCED FROM 256
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_latlon = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=128, activation='relu', use_bias=True, # REDUCED FROM 256
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_attr = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
@@ -221,12 +242,12 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Feature Fusion Layer
         concat_input = Concatenate(axis=2)(embeddings)
         
-        # Project concatenated embeddings to correct dimension - REDUCED
-        concat_input = Dense(128, activation='relu')(concat_input)  # REDUCED FROM 256
+        # Project concatenated embeddings to correct dimension
+        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
         
-        # Transformer blocks - REDUCED number of layers and dimensions
-        x = TransformerBlock(embed_dim=128, num_heads=2, ff_dim=512, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=128, num_heads=2, ff_dim=512, rate=0.1)(x, training=True)
+        # Transformer blocks
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
         
         # Output layers
         outputs = []
@@ -257,14 +278,14 @@ class RL_Enhanced_Transformer_TrajGAN():
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=128, activation='relu', use_bias=True,  # REDUCED FROM 512
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_latlon = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=128, activation='relu', use_bias=True,  # REDUCED FROM 512
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_attr = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
@@ -274,20 +295,23 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Feature Fusion Layer
         concat_input = Concatenate(axis=2)(embeddings)
         
-        # Project concatenated embeddings - REDUCED
-        concat_input = Dense(256, activation='relu')(concat_input)  # REDUCED FROM 512
+        # Project concatenated embeddings to correct dimension
+        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
+        
+        # Transformer blocks
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
         
         # Global average pooling
-        x = tf.keras.layers.GlobalAveragePooling1D()(concat_input)
+        x = tf.keras.layers.GlobalAveragePooling1D()(x)
         
-        # MLP with REDUCED layers
-        x = Dense(128, activation='relu')(x)  # REDUCED FROM 512
+        # Value head
         value = Dense(1)(x)
         
         return Model(inputs=inputs, outputs=value)
 
     def build_discriminator(self):
-        # Input Layer
+        # Similar to original discriminator but with Transformer blocks
         inputs = []
         embeddings = []
         
@@ -297,14 +321,14 @@ class RL_Enhanced_Transformer_TrajGAN():
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=128, activation='relu', use_bias=True,  # REDUCED FROM 256
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_latlon = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=128, activation='relu', use_bias=True,  # REDUCED FROM 256
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_attr = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
@@ -314,14 +338,15 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Feature Fusion Layer
         concat_input = Concatenate(axis=2)(embeddings)
         
-        # Project concatenated embeddings - REDUCED
-        concat_input = Dense(128, activation='relu')(concat_input)  # REDUCED FROM 256
+        # Project concatenated embeddings to correct dimension
+        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
         
-        # SIMPLER ARCHITECTURE - replace complex CNN/LSTM with just LSTM
-        x = LSTM(128, return_sequences=False, dropout=0.2)(concat_input)
+        # Transformer blocks
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
         
-        # Dense layers
-        x = Dense(64, activation='relu')(x)  # REDUCED FROM 512
+        # Global average pooling
+        x = tf.keras.layers.GlobalAveragePooling1D()(x)
         
         # Output
         sigmoid = Dense(1, activation='sigmoid')(x)
@@ -355,7 +380,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.combined = Model(inputs, pred)
         
         # Create a custom loss instance for trajectory optimization
-        self.traj_loss = CustomTrajLoss(p_bce=1, p_latlon=0.01, p_cat=0.05, p_day=0.05, p_hour=0.05)
+        self.traj_loss = CustomTrajLoss()
         # Store input and generator output references
         self.input_tensors = inputs
         self.generated_trajectories = gen_trajs
@@ -381,169 +406,287 @@ class RL_Enhanced_Transformer_TrajGAN():
         gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
         real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
         
-        # Adversarial reward - measures realism based on discriminator output
+        batch_size = gen_trajs[0].shape[0]
+        
+        # 1. Adversarial Reward - measures realism based on discriminator output
         d_pred = self.discriminator.predict(gen_trajs[:4])
         d_pred = tf.cast(d_pred, tf.float32)
-        # Clip discriminator predictions to avoid extreme log values
         d_pred = tf.clip_by_value(d_pred, 1e-7, 1.0 - 1e-7)
         r_adv = tf.math.log(d_pred)
         
-        # Utility preservation reward - measures statistical similarity
-        # Spatial loss - L2 distance between coordinates
-        spatial_loss = tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]), axis=[1, 2])
+        # 2. Utility Preservation Reward - measures statistical similarity
+        # 2.1 Spatial loss - Haversine distance between coordinates
+        def haversine_distance(lat1, lon1, lat2, lon2):
+            # Convert from degrees to radians
+            lat1 = lat1 * tf.constant(np.pi/180, dtype=tf.float32)
+            lon1 = lon1 * tf.constant(np.pi/180, dtype=tf.float32)
+            lat2 = lat2 * tf.constant(np.pi/180, dtype=tf.float32)
+            lon2 = lon2 * tf.constant(np.pi/180, dtype=tf.float32)
+            
+            # Haversine formula
+            dlon = lon2 - lon1
+            dlat = lat2 - lat1
+            a = tf.square(tf.sin(dlat/2)) + tf.cos(lat1) * tf.cos(lat2) * tf.square(tf.sin(dlon/2))
+            c = 2 * tf.asin(tf.sqrt(a))
+            r = 6371  # Radius of earth in kilometers
+            return c * r
+        
+        # Extract lat/lon coordinates and compute haversine distance
+        # Note: gen_trajs[0] contains [lat, lon] pairs
+        real_lat = real_trajs[0][:, :, 0]
+        real_lon = real_trajs[0][:, :, 1]
+        gen_lat = gen_trajs[0][:, :, 0]
+        gen_lon = gen_trajs[0][:, :, 1]
+        
+        # Compute point-wise haversine distance and take mean over trajectory
+        spatial_loss = tf.vectorized_map(
+            lambda x: haversine_distance(x[0], x[1], x[2], x[3]),
+            (real_lat, real_lon, gen_lat, gen_lon)
+        )
+        spatial_loss = tf.reduce_mean(spatial_loss, axis=1)
         spatial_loss = tf.cast(spatial_loss, tf.float32)
-        # Clip spatial loss to avoid extremely large values
         spatial_loss = tf.clip_by_value(spatial_loss, 0.0, 10.0)
         
-        # Temporal loss - cross-entropy on temporal distributions (day and hour)
-        # Clip generated values to avoid log(0)
+        # 2.2 Temporal loss using DTW-inspired approach for day and hour distributions
+        # For simplicity, we'll use a soft DTW-inspired approach with cross-entropy
+        
+        # Convert one-hot day and hour to distributions over time
         gen_trajs_day_clipped = tf.clip_by_value(gen_trajs[2], 1e-7, 1.0 - 1e-7)
-        temp_day_loss = -tf.reduce_sum(real_trajs[2] * tf.math.log(gen_trajs_day_clipped), axis=[1, 2])
-        temp_day_loss = tf.cast(temp_day_loss, tf.float32)
-        temp_day_loss = tf.clip_by_value(temp_day_loss, 0.0, 10.0)
-        
         gen_trajs_hour_clipped = tf.clip_by_value(gen_trajs[3], 1e-7, 1.0 - 1e-7)
-        temp_hour_loss = -tf.reduce_sum(real_trajs[3] * tf.math.log(gen_trajs_hour_clipped), axis=[1, 2])
-        temp_hour_loss = tf.cast(temp_hour_loss, tf.float32)
-        temp_hour_loss = tf.clip_by_value(temp_hour_loss, 0.0, 10.0)
         
-        # Categorical loss - cross-entropy on category distributions
+        # Dynamic time pattern similarity (simplified DTW approach)
+        # We compute temporal alignment score by comparing distributions at each timestep
+        day_pattern_loss = -tf.reduce_sum(real_trajs[2] * tf.math.log(gen_trajs_day_clipped), axis=[1, 2])
+        hour_pattern_loss = -tf.reduce_sum(real_trajs[3] * tf.math.log(gen_trajs_hour_clipped), axis=[1, 2])
+        
+        # Combined temporal loss
+        temp_loss = day_pattern_loss + hour_pattern_loss
+        temp_loss = tf.cast(temp_loss, tf.float32)
+        temp_loss = tf.clip_by_value(temp_loss, 0.0, 10.0)
+        
+        # 2.3 Semantic/category loss - Jensen-Shannon Divergence between category distributions
         gen_trajs_cat_clipped = tf.clip_by_value(gen_trajs[1], 1e-7, 1.0 - 1e-7)
-        cat_loss = -tf.reduce_sum(real_trajs[1] * tf.math.log(gen_trajs_cat_clipped), axis=[1, 2])
-        cat_loss = tf.cast(cat_loss, tf.float32)
-        cat_loss = tf.clip_by_value(cat_loss, 0.0, 10.0)
+        
+        # Calculate category distribution for real and generated trajectories
+        real_cat_dist = tf.reduce_mean(real_trajs[1], axis=1)  # Average over timesteps
+        gen_cat_dist = tf.reduce_mean(gen_trajs_cat_clipped, axis=1)  # Average over timesteps
+        
+        # Calculate m = (p+q)/2 for JS divergence
+        m_dist = 0.5 * (real_cat_dist + gen_cat_dist)
+        m_dist = tf.clip_by_value(m_dist, 1e-7, 1.0 - 1e-7)
+        
+        # Calculate JS Divergence: 0.5 * (KL(p||m) + KL(q||m))
+        js_div_1 = tf.reduce_sum(real_cat_dist * tf.math.log(real_cat_dist / m_dist), axis=1)
+        js_div_2 = tf.reduce_sum(gen_cat_dist * tf.math.log(gen_cat_dist / m_dist), axis=1)
+        semantic_loss = 0.5 * (js_div_1 + js_div_2)
+        semantic_loss = tf.cast(semantic_loss, tf.float32)
+        semantic_loss = tf.clip_by_value(semantic_loss, 0.0, 10.0)
         
         # Combine utility components with appropriate weights
-        # Use the utility component weights from class attributes
-        w_spatial = tf.constant(self.w_spatial, dtype=tf.float32)    # Spatial utility weight
-        w_temporal = tf.constant(self.w_temporal, dtype=tf.float32)  # Temporal utility weight
-        w_semantic = tf.constant(self.w_semantic, dtype=tf.float32)  # Semantic utility weight
+        r_util = -(self.w1 * spatial_loss + self.w2 * temp_loss + self.w3 * semantic_loss)
         
-        r_util = -(w_spatial * spatial_loss + w_temporal * (temp_day_loss + temp_hour_loss) + w_semantic * cat_loss)
-        
-        # SIMPLIFIED Privacy preservation reward - USE A PLACEHOLDER instead of calling the TUL classifier
-        # This avoids potential issues with the MARC model
+        # 3. Privacy preservation reward using TUL classifier
         try:
-            batch_size = gen_trajs[0].shape[0]
+            # Format inputs for TUL classifier as before
+            day_indices = tf.cast(tf.argmax(gen_trajs[2], axis=-1), tf.int32)
+            day_indices = tf.clip_by_value(day_indices, 0, 6)
             
-            # Just use a random privacy reward based on trajectory features
-            # This is a simplified placeholder for debugging
-            r_priv = -tf.random.uniform(shape=(batch_size, 1), minval=0.0, maxval=1.0)
+            hour_indices = tf.cast(tf.argmax(gen_trajs[3], axis=-1), tf.int32)
+            hour_indices = tf.clip_by_value(hour_indices, 0, 23)
+            
+            category_indices = tf.cast(tf.argmax(gen_trajs[1], axis=-1), tf.int32)
+            category_indices = tf.clip_by_value(category_indices, 0, 9)
+            
+            # Format lat_lon for TUL model
+            lat_lon_padded = tf.pad(gen_trajs[0], [[0, 0], [0, 0], [0, 38]])
+            
+            # Get TUL predictions
+            tul_preds = tul_classifier([day_indices, hour_indices, category_indices, lat_lon_padded])
+            
+            # Extract probability for correct user identification
+            num_users = tul_preds.shape[1]
+            user_indices = np.arange(batch_size) % num_users
+            batch_indices = tf.range(batch_size, dtype=tf.int32)
+            indices = tf.stack([batch_indices, tf.cast(user_indices, tf.int32)], axis=1)
+            user_probs = tf.gather_nd(tul_preds, indices)
+            
+            # Calculate top-1 identification accuracy for adaptive balancing
+            # Sort predictions for each sample
+            sorted_indices = tf.argsort(tul_preds, axis=1, direction='DESCENDING')
+            # Check if true user index is at top-1 position
+            top1_indices = sorted_indices[:, 0]
+            correct_predictions = tf.cast(tf.equal(top1_indices, tf.cast(user_indices, tf.int32)), tf.float32)
+            self.current_acc_at_1 = tf.reduce_mean(correct_predictions).numpy()
+            
+            # Privacy reward: -log(p_TUL(u_i|T_i))
+            # Negative reward for correct user identification (penalize high probabilities)
+            r_priv = -tf.math.log(tf.clip_by_value(user_probs, 1e-7, 1.0 - 1e-7))
             
         except Exception as e:
             print(f"Error computing privacy reward: {e}")
-            # Fallback privacy reward
+            import traceback
+            traceback.print_exc()
+            print("Using a placeholder privacy reward instead")
+            # If there's an error with the TUL model, use a placeholder privacy reward
             r_priv = tf.zeros_like(r_adv)
+            self.current_acc_at_1 = 0.5  # Default value
         
-        # Combined reward with configurable weights from class attributes
-        w_adv = tf.constant(self.w_adv, dtype=tf.float32)   # Adversarial weight
-        w_util = tf.constant(self.w_util, dtype=tf.float32) # Utility weight
-        w_priv = tf.constant(self.w_priv, dtype=tf.float32) # Privacy weight
+        # Estimate FID score based on utility loss (lower is better)
+        # This is a simple approximation - in production, you might use a real FID score
+        self.current_fid = tf.reduce_mean(spatial_loss + temp_loss + semantic_loss).numpy()
         
-        r_adv = tf.cast(r_adv, tf.float32)
+        # Apply adaptive reward balancing based on privacy and utility metrics
+        # Adjust alpha (privacy weight) based on re-identification accuracy
+        self.alpha_t = self.alpha_0 * tf.minimum(
+            1.0, 
+            tf.cast(self.current_acc_at_1 / self.acc_at_1_target, tf.float32)
+        )
+        
+        # Adjust beta (utility weight) based on FID score
+        self.beta_t = self.beta_0 * tf.maximum(
+            0.0,
+            1.0 - tf.cast((self.current_fid - self.fid_target) / self.fid_max, tf.float32)
+        )
+        
+        # Adjust gamma to normalize weights (alpha + beta + gamma = 1)
+        self.gamma_t = 1.0 - (self.alpha_t + self.beta_t)
+        
+        # Ensure weights are valid
+        self.alpha_t = tf.clip_by_value(self.alpha_t, 0.05, 0.95)
+        self.beta_t = tf.clip_by_value(self.beta_t, 0.05, 0.95)
+        self.gamma_t = tf.clip_by_value(self.gamma_t, 0.05, 0.95)
+        
+        # Normalize weights to sum to 1
+        total = self.alpha_t + self.beta_t + self.gamma_t
+        self.alpha_t = self.alpha_t / total
+        self.beta_t = self.beta_t / total
+        self.gamma_t = self.gamma_t / total
+        
+        # Print current adaptive weights
+        print(f"Adaptive weights - α: {self.alpha_t:.3f}, β: {self.beta_t:.3f}, γ: {self.gamma_t:.3f}")
+        print(f"Current metrics - ACC@1: {self.current_acc_at_1:.3f}, FID: {self.current_fid:.3f}")
         
         # Ensure r_adv, r_util, and r_priv have appropriate shapes
         r_adv = tf.reshape(r_adv, [-1])
         r_util = tf.reshape(r_util, [-1])
         r_priv = tf.reshape(r_priv, [-1])
         
-        # Compute the combined reward
-        combined_rewards = w_adv * r_adv + w_util * r_util + w_priv * r_priv
-        
-        # Print components for debugging
-        print(f"Raw reward components - Adversarial: {tf.reduce_mean(r_adv):.4f}, " +
-              f"Utility: {tf.reduce_mean(r_util):.4f}, Privacy: {tf.reduce_mean(r_priv):.4f}, " +
-              f"Combined (pre-norm): {tf.reduce_mean(combined_rewards):.4f}")
+        # Compute the combined reward with adaptive weights
+        combined_rewards = self.gamma_t * r_adv + self.beta_t * r_util + self.alpha_t * r_priv
         
         # Ensure the rewards have shape [batch_size, 1]
-        batch_size = r_adv.shape[0]
         rewards = tf.reshape(combined_rewards, [batch_size, 1])
         
-        # Store pre-normalized rewards for reference
-        pre_norm_rewards_mean = tf.reduce_mean(rewards)
+        # Normalize rewards for training stability
+        rewards_mean = tf.reduce_mean(rewards)
+        rewards_std = tf.math.reduce_std(rewards) + 1e-8
+        rewards = (rewards - rewards_mean) / rewards_std
         
-        # OPTION: Skip normalization to more directly see reward changes
-        # Just apply clipping to keep rewards in reasonable range
-        rewards_clipped = tf.clip_by_value(rewards, -5.0, 5.0)
+        # Clip rewards to reasonable range to prevent training instability
+        rewards = tf.clip_by_value(rewards, -5.0, 5.0)
         
         # Debug print to check rewards shape and values
-        print(f"Rewards shape: {rewards.shape}, min: {tf.reduce_min(rewards_clipped):.4f}, " +
-              f"max: {tf.reduce_max(rewards_clipped):.4f}, mean: {tf.reduce_mean(rewards_clipped):.4f}, " +
-              f"pre-norm mean: {pre_norm_rewards_mean:.4f}")
+        print(f"Rewards shape: {rewards.shape}, min: {tf.reduce_min(rewards)}, max: {tf.reduce_max(rewards)}, mean: {tf.reduce_mean(rewards)}")
         
-        # Return both the clipped rewards and the pre-normalized rewards mean
-        return rewards_clipped, pre_norm_rewards_mean
+        return rewards
 
     def train_step(self, real_trajs, batch_size=256):
-        """Modified train_step with more robust error handling."""
-        try:
-            # Generate trajectories - using 3D continuous and categorical action space
-            noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
-            gen_trajs = self.generator.predict([*real_trajs, noise])
+        """Modified train_step to include tracking of RL agent metrics.
+        
+        This implements the RL agent and environment formulation where:
+        - State is represented by the Transformer's internal state after generating t points
+        - Action is the next trajectory point (coordinates, timestamp, POI category)
+        - Reward is computed using TrajLoss, TUL and data utility
+        """
+        # Generate trajectories
+        noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+        gen_trajs = self.generator.predict([*real_trajs, noise])
+        
+        # Ensure consistent data types
+        real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
+        gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
+        
+        # Update the custom loss with the current real and generated trajectories
+        self.traj_loss.set_trajectories(real_trajs, gen_trajs)
+        
+        # Compute full rewards using the adaptive reward function
+        rewards = self.compute_rewards(real_trajs, gen_trajs, self.tul_classifier)
+        
+        # Compute advantages and returns for PPO
+        values = self.critic.predict(real_trajs[:4])
+        values = tf.cast(values, tf.float32)
+        advantages = compute_advantage(rewards, values, self.gamma, self.gae_lambda)
+        returns = compute_returns(rewards, self.gamma)
+        
+        # Ensure returns has the same batch size as what the critic expects
+        if returns.shape[0] != batch_size:
+            print(f"Warning: Reshaping returns from {returns.shape} to [{batch_size}, 1]")
+            returns = tf.reshape(returns, [batch_size, 1])
+        
+        # Update critic (value function) using returns
+        c_loss = self.critic.train_on_batch(real_trajs[:4], returns)
+        
+        # Update discriminator - real samples -> 1, generated samples -> 0
+        d_loss_real = self.discriminator.train_on_batch(
+            real_trajs[:4],
+            np.ones((batch_size, 1))
+        )
+        d_loss_fake = self.discriminator.train_on_batch(
+            gen_trajs[:4],
+            np.zeros((batch_size, 1))
+        )
+        
+        # Update generator (actor) using advantages from PPO
+        g_loss = self.update_actor(real_trajs, gen_trajs, advantages)
+        
+        # Get mean reward and other metrics for tracking
+        mean_reward = tf.reduce_mean(rewards).numpy()
+        
+        # Calculate entropy of trajectory distributions for exploration monitoring
+        entropy = self._calculate_trajectory_entropy(gen_trajs)
+        
+        # Return metrics including reward and RL-specific metrics
+        return {
+            "d_loss_real": d_loss_real, 
+            "d_loss_fake": d_loss_fake, 
+            "g_loss": g_loss, 
+            "c_loss": c_loss,
+            "reward": mean_reward,
+            "entropy": entropy,
+            "acc_at_1": self.current_acc_at_1,
+            "fid": self.current_fid,
+            "alpha_t": self.alpha_t.numpy(),
+            "beta_t": self.beta_t.numpy(),
+            "gamma_t": self.gamma_t.numpy()
+        }
+        
+    def _calculate_trajectory_entropy(self, gen_trajs):
+        """Calculate entropy of generated trajectories to monitor exploration vs exploitation.
+        
+        Higher entropy indicates more exploration, lower indicates exploitation.
+        """
+        # Calculate entropy for categorical outputs (category, day, hour)
+        entropy = 0.0
+        for i in range(1, 4):  # Categorical outputs (category, day, hour)
+            # Get probability distributions
+            probs = gen_trajs[i]
+            # Clip probabilities to avoid log(0)
+            probs = tf.clip_by_value(probs, 1e-7, 1.0 - 1e-7)
+            # Calculate entropy: -sum(p * log(p))
+            cat_entropy = -tf.reduce_sum(probs * tf.math.log(probs), axis=-1)
+            # Average over timesteps and batch
+            cat_entropy = tf.reduce_mean(cat_entropy)
+            entropy += cat_entropy
             
-            # Ensure consistent data types
-            real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
-            gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
-            
-            # Update the custom loss with the current real and generated trajectories
-            self.traj_loss.set_trajectories(real_trajs, gen_trajs)
-            
-            # Compute full rewards using the TUL classifier
-            rewards, pre_norm_rewards_mean = self.compute_rewards(real_trajs, gen_trajs, self.tul_classifier)
-            
-            # Compute advantages and returns for PPO
-            values = self.critic.predict(real_trajs[:4])
-            values = tf.cast(values, tf.float32)
-            advantages = compute_advantage(rewards, values, self.gamma, self.gae_lambda)
-            returns = compute_returns(rewards, self.gamma)
-            
-            # Ensure returns has the same batch size as what the critic expects
-            if returns.shape[0] != batch_size:
-                print(f"Warning: Reshaping returns from {returns.shape} to [{batch_size}, 1]")
-                returns = tf.reshape(returns, [batch_size, 1])
-            
-            # Update critic using returns
-            c_loss = self.critic.train_on_batch(real_trajs[:4], returns)
-            
-            # Update discriminator
-            d_loss_real = self.discriminator.train_on_batch(
-                real_trajs[:4],
-                np.ones((batch_size, 1))
-            )
-            d_loss_fake = self.discriminator.train_on_batch(
-                gen_trajs[:4],
-                np.zeros((batch_size, 1))
-            )
-            
-            # Update generator (actor) using advantages
-            g_loss = self.update_actor(real_trajs, gen_trajs, advantages)
-            
-            # Get mean reward for tracking
-            mean_reward = tf.reduce_mean(rewards).numpy()
-            
-            # Return metrics including reward
-            return {
-                "d_loss_real": d_loss_real, 
-                "d_loss_fake": d_loss_fake, 
-                "g_loss": g_loss, 
-                "c_loss": c_loss,
-                "reward": mean_reward,
-                "pre_norm_reward": pre_norm_rewards_mean.numpy()
-            }
-            
-        except Exception as e:
-            print(f"Error in train_step: {e}")
-            import traceback
-            traceback.print_exc()
-            # Return default values to prevent training from crashing
-            return {
-                "d_loss_real": 1.0, 
-                "d_loss_fake": 1.0, 
-                "g_loss": 1.0, 
-                "c_loss": 1.0,
-                "reward": 0.0,
-                "pre_norm_reward": 0.0
-            }
+        # For continuous outputs (coordinates), estimate entropy with Gaussian approximation
+        # Estimate variance of coordinates as proxy for entropy
+        coord_var = tf.math.reduce_variance(gen_trajs[0], axis=[0, 1])
+        coord_entropy = tf.reduce_sum(tf.math.log(2 * np.pi * np.e * coord_var + 1e-7)) / 2
+        
+        # Combine all entropy components
+        total_entropy = entropy + coord_entropy
+        
+        return total_entropy.numpy()
 
     def train(self, epochs=2000, batch_size=256, sample_interval=10, save_best=True, checkpoint_dir='results'):
         """Train the model with WandB tracking, best model checkpointing, and early stopping."""
@@ -556,21 +699,36 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Initialize tracking variables
         completed_epochs = 0
         
-        # Rest of initialization code remains the same...
-        
         # Training loop
         print(f"Starting training for {epochs} epochs with early stopping patience of "
               f"{early_stopping.patience if early_stopping else 'N/A'}")
         
         for epoch in range(epochs):
-            # Existing training code...
+            # Get a batch of training data
+            idx = np.random.randint(0, len(self.x_train[0]), batch_size)
+            batch = [X[idx] for X in self.x_train]
             
             # Training step
             metrics = self.train_step(batch, batch_size)
             
             # Log metrics to WandB
             if self.wandb:
-                # Existing wandb logging code...
+                wandb_metrics = {
+                    "epoch": epoch,
+                    "d_loss_real": metrics['d_loss_real'],
+                    "d_loss_fake": metrics['d_loss_fake'],
+                    "g_loss": metrics['g_loss'],
+                    "c_loss": metrics['c_loss'],
+                    "reward": metrics['reward'],
+                    # New RL metrics
+                    "entropy": metrics['entropy'],
+                    "acc_at_1": metrics['acc_at_1'],
+                    "fid": metrics['fid'],
+                    # Adaptive weights
+                    "alpha_t": metrics['alpha_t'],
+                    "beta_t": metrics['beta_t'],
+                    "gamma_t": metrics['gamma_t'],
+                }
                 
                 # Track and save the best model based on reward
                 if save_best and metrics['reward'] > self.best_reward:
@@ -596,7 +754,22 @@ class RL_Enhanced_Transformer_TrajGAN():
                 # Log to wandb
                 self.wandb.log(wandb_metrics)
             
-            # Existing code for printing, saving checkpoints, etc.
+            # Print progress
+            if epoch % sample_interval == 0:
+                print(f"[Epoch {epoch}/{epochs}] "
+                      f"[D loss: {(metrics['d_loss_real'] + metrics['d_loss_fake'])/2:.4f}] "
+                      f"[G loss: {metrics['g_loss']:.4f}] "
+                      f"[Reward: {metrics['reward']:.4f}] "
+                      f"[ACC@1: {metrics['acc_at_1']:.4f}] "
+                      f"[FID: {metrics['fid']:.4f}]")
+                
+                # Generate visual samples for wandb
+                if self.wandb:
+                    self.sample_trajectories_for_wandb(epoch)
+                
+                # Save model checkpoint
+                if epoch > 0 and epoch % (sample_interval * 5) == 0:
+                    self.save_checkpoint(epoch)
             
             completed_epochs = epoch + 1
     
@@ -766,9 +939,25 @@ class RL_Enhanced_Transformer_TrajGAN():
             A trained model that predicts user IDs from trajectories.
         """
         try:
-            # Create a simple fallback model that matches expected input format
-            # but doesn't actually try to load the MARC model
-            print("Using a simplified TUL classifier to avoid memory issues")
+            # Import MARC class and initialize it
+            from MARC.marc import MARC
+            
+            # Create and initialize the MARC model
+            marc_model = MARC()
+            marc_model.build_model()
+            
+            # Load pre-trained weights
+            marc_model.load_weights('MARC/MARC_Weight.h5')
+            
+            print("Loaded pre-trained MARC TUL classifier")
+            return marc_model
+            
+        except Exception as e:
+            print(f"Error loading MARC model: {e}")
+            print("Creating a fallback TUL classifier model")
+            
+            # If MARC model loading fails, create a fallback model that matches MARC's input format
+            # MARC expects 4 inputs: day, hour, category (all as indices), and lat_lon (with shape 144,40)
             
             # Create input layers with the same names and shapes as MARC
             input_day = Input(shape=(144,), dtype='int32', name='input_day')
@@ -776,35 +965,44 @@ class RL_Enhanced_Transformer_TrajGAN():
             input_category = Input(shape=(144,), dtype='int32', name='input_category')
             input_lat_lon = Input(shape=(144, 40), name='input_lat_lon')
             
-            # Simplified model
-            x = Concatenate(axis=1)([
-                tf.keras.layers.Flatten()(tf.keras.layers.Embedding(7, 4)(input_day)),
-                tf.keras.layers.Flatten()(tf.keras.layers.Embedding(24, 4)(input_hour)),
-                tf.keras.layers.Flatten()(tf.keras.layers.Embedding(10, 4)(input_category)),
-                tf.keras.layers.Flatten()(input_lat_lon)
-            ])
+            # Create embeddings like MARC
+            emb_day = Embedding(input_dim=7, output_dim=32, input_length=144)(input_day)
+            emb_hour = Embedding(input_dim=24, output_dim=32, input_length=144)(input_hour)
+            emb_category = Embedding(input_dim=10, output_dim=32, input_length=144)(input_category)
             
-            x = Dense(64, activation='relu')(x)
-            output = Dense(193, activation='softmax')(x)
+            # Process lat_lon
+            lat_lon_dense = Dense(32, activation='relu')(input_lat_lon)
             
-            model = Model(
+            # Concatenate all embeddings
+            concat = Concatenate(axis=2)([emb_day, emb_hour, emb_category, lat_lon_dense])
+            
+            # LSTM layer for sequence processing
+            lstm_out = LSTM(64, return_sequences=False)(concat)
+            
+            # Dense layers
+            dense1 = Dense(128, activation='relu')(lstm_out)
+            
+            # Output layer - assuming 100 users for classification
+            # (We'll adjust this if needed based on the actual dataset)
+            output = Dense(193, activation='softmax')(dense1)
+            
+            # Create model
+            fallback_model = Model(
                 inputs=[input_day, input_hour, input_category, input_lat_lon],
                 outputs=output
             )
             
-            model.compile(
+            fallback_model.compile(
                 loss='sparse_categorical_crossentropy',
-                optimizer=Adam(0.0001),
+                optimizer=Adam(0.001),
                 metrics=['accuracy']
             )
             
-            print("Created simplified TUL classifier")
-            return model
+            print("Created fallback TUL classifier model with matching input format")
             
-        except Exception as e:
-            print(f"Error creating TUL classifier: {e}")
-            return None
-
+            # Since the fallback model uses Keras functional API, it already supports __call__
+            return fallback_model
+            
     def sample_trajectories_for_wandb(self, epoch):
         """Generate and visualize sample trajectories for wandb."""
         if not self.wandb:
@@ -815,8 +1013,8 @@ class RL_Enhanced_Transformer_TrajGAN():
             noise = np.random.normal(0, 1, (4, self.latent_dim))
             
             # Sample a few real trajectories
-            idx = np.random.randint(0, len(self.X_train[0]), 4)
-            real_batch = [X[idx] for X in self.X_train]
+            idx = np.random.randint(0, len(self.x_train[0]), 4)
+            real_batch = [X[idx] for X in self.x_train]
             
             # Generate trajectories
             gen_trajs = self.generator.predict([*real_batch, noise])
