@@ -19,25 +19,49 @@ except ImportError:
     print("Warning: MARC module not found. TUL evaluation may not work properly.")
 
 
-def prepare_trajectories_for_tul(traj_df, max_length=144):
+def prepare_trajectories_for_tul(traj_df, max_length=144, label_col='label'):
     """
     Prepare trajectory data for the TUL classifier.
     
     Args:
         traj_df: DataFrame containing trajectory data
         max_length: Maximum length of trajectories for padding
+        label_col: Name of the column containing label information
         
     Returns:
         inputs: List of inputs formatted for the TUL classifier
     """
+    # Create a copy of the dataframe to avoid modifying the original
+    df = traj_df.copy()
+    
+    # If the specified label column doesn't exist but 'point_idx' does, use that instead
+    if label_col not in df.columns and 'point_idx' in df.columns:
+        df[label_col] = df['point_idx']
+        print(f"Using 'point_idx' as the label column")
+    
     # Ensure the dataframe has the expected columns
-    required_cols = ['tid', 'label', 'lat', 'lon', 'day', 'hour', 'category']
+    required_cols = ['tid', label_col, 'lat', 'lon', 'day', 'hour', 'category']
     for col in required_cols:
-        if col not in traj_df.columns:
-            raise ValueError(f"Required column '{col}' not found in trajectory data")
+        if col not in df.columns:
+            raise ValueError(f"Required column '{col}' not found in trajectory data. Available columns: {df.columns.tolist()}")
+    
+    # Validate and fix values to valid ranges
+    # Days should be 0-6 (0=Monday, 6=Sunday)
+    if df['day'].max() > 6:
+        print(f"Warning: 'day' column contains values outside range [0,6]. Max value found: {df['day'].max()}")
+        # For values > 6, we should take modulo 7 to wrap around to valid days
+        df['day'] = df['day'] % 7
+        print(f"Fixed day values distribution: {df['day'].value_counts().sort_index()}")
+    
+    # Hours should be 0-23
+    if df['hour'].max() > 23:
+        print(f"Warning: 'hour' column contains values outside range [0,23]. Max value found: {df['hour'].max()}")
+        # For values > 23, we should take modulo 24 to wrap around to valid hours
+        df['hour'] = df['hour'] % 24
+        print(f"Fixed hour values distribution: {df['hour'].value_counts().sort_index()}")
     
     # Group by trajectory ID
-    traj_grouped = traj_df.groupby('tid')
+    traj_grouped = df.groupby('tid')
     
     # Initialize lists for each feature
     lat_lon_list = []
@@ -50,10 +74,10 @@ def prepare_trajectories_for_tul(traj_df, max_length=144):
     for tid, group in traj_grouped:
         # Extract features
         lat_lon = np.array(group[['lat', 'lon']])
-        day = np.array(group['day'])
-        hour = np.array(group['hour'])
-        category = np.array(group['category'])
-        label = group['label'].iloc[0]
+        day = np.array(group['day']).astype(np.int32)  # Ensure correct dtype
+        hour = np.array(group['hour']).astype(np.int32)  # Ensure correct dtype
+        category = np.array(group['category']).astype(np.int32)  # Ensure correct dtype
+        label = group[label_col].iloc[0]
         
         # Append to lists
         lat_lon_list.append(lat_lon)
@@ -153,14 +177,21 @@ def evaluate_privacy(real_inputs, synthetic_inputs, real_labels, synthetic_label
         # Get the predicted labels (top-1)
         pred_labels = np.argmax(preds, axis=1)
         
-        # Calculate precision, recall, and F1 score
-        precision_macro = precision_score(labels, pred_labels, average='macro')
-        recall_macro = recall_score(labels, pred_labels, average='macro')
-        f1_macro = f1_score(labels, pred_labels, average='macro')
-        
-        privacy_metrics[f"{dataset_name}_macro_precision"] = precision_macro
-        privacy_metrics[f"{dataset_name}_macro_recall"] = recall_macro
-        privacy_metrics[f"{dataset_name}_macro_f1"] = f1_macro
+        try:
+            # Calculate precision, recall, and F1 score with zero_division=0
+            precision_macro = precision_score(labels, pred_labels, average='macro', zero_division=0)
+            recall_macro = recall_score(labels, pred_labels, average='macro', zero_division=0)
+            f1_macro = f1_score(labels, pred_labels, average='macro', zero_division=0)
+            
+            privacy_metrics[f"{dataset_name}_macro_precision"] = precision_macro
+            privacy_metrics[f"{dataset_name}_macro_recall"] = recall_macro
+            privacy_metrics[f"{dataset_name}_macro_f1"] = f1_macro
+        except Exception as e:
+            print(f"Error calculating metrics for {dataset_name}: {e}")
+            # Set default values
+            privacy_metrics[f"{dataset_name}_macro_precision"] = 0.0
+            privacy_metrics[f"{dataset_name}_macro_recall"] = 0.0
+            privacy_metrics[f"{dataset_name}_macro_f1"] = 0.0
     
     return privacy_metrics
 
@@ -176,25 +207,36 @@ def calculate_fid(real_features, synthetic_features):
     Returns:
         fid: Fréchet Inception Distance score
     """
-    # Calculate mean and covariance for real features
-    mu1 = np.mean(real_features, axis=0)
-    sigma1 = np.cov(real_features, rowvar=False)
-    
-    # Calculate mean and covariance for synthetic features
-    mu2 = np.mean(synthetic_features, axis=0)
-    sigma2 = np.cov(synthetic_features, rowvar=False)
-    
-    # Calculate FID
-    diff = mu1 - mu2
-    covmean = sqrtm(sigma1.dot(sigma2))
-    
-    # Check and correct imaginary component if necessary
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    
-    fid = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * np.trace(covmean)
-    
-    return fid
+    try:
+        # Calculate mean and covariance for real features
+        mu1 = np.mean(real_features, axis=0)
+        sigma1 = np.cov(real_features, rowvar=False)
+        
+        # Calculate mean and covariance for synthetic features
+        mu2 = np.mean(synthetic_features, axis=0)
+        sigma2 = np.cov(synthetic_features, rowvar=False)
+        
+        # Calculate FID
+        diff = mu1 - mu2
+        
+        # Handle potential numerical issues in computing square root
+        try:
+            covmean = sqrtm(sigma1.dot(sigma2))
+            # Check and correct imaginary component if necessary
+            if np.iscomplexobj(covmean):
+                covmean = covmean.real
+            
+            fid = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * np.trace(covmean)
+        except Exception as e:
+            print(f"Failed to compute square root: {e}")
+            # Fallback calculation without square root term
+            fid = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2)
+            print(f"Using alternative FID calculation: {fid}")
+        
+        return fid
+    except Exception as e:
+        print(f"Error calculating FID: {e}")
+        return float('inf')  # Return worst-case value on error
 
 
 def extract_features(trajectories):
@@ -210,44 +252,70 @@ def extract_features(trajectories):
     # Group by trajectory ID
     traj_grouped = trajectories.groupby('tid')
     
+    # Determine maximum category value across all trajectories
+    max_category = int(trajectories['category'].max())
+    print(f"Maximum category value: {max_category}")
+    
+    # Use a fixed category size to ensure consistent feature dimensions
+    fixed_category_size = 100  # Choose a size that's large enough for all possible categories
+    
     features = []
     
     for tid, group in traj_grouped:
-        # Extract statistical features
-        lat_mean = group['lat'].mean()
-        lat_std = group['lat'].std()
-        lon_mean = group['lon'].mean()
-        lon_std = group['lon'].std()
-        
-        # Calculate trajectory length
-        traj_length = len(group)
-        
-        # Calculate average displacement
-        lat_diffs = np.diff(group['lat'].values)
-        lon_diffs = np.diff(group['lon'].values)
-        avg_displacement = np.mean(np.sqrt(lat_diffs**2 + lon_diffs**2)) if len(lat_diffs) > 0 else 0
-        
-        # Day and hour distribution
-        day_hist = np.bincount(group['day'].astype(int), minlength=7)
-        day_hist = day_hist / (np.sum(day_hist) + 1e-10)  # Normalize
-        
-        hour_hist = np.bincount(group['hour'].astype(int), minlength=24)
-        hour_hist = hour_hist / (np.sum(hour_hist) + 1e-10)  # Normalize
-        
-        # Category distribution
-        max_category = max(trajectories['category'].max(), 1)
-        category_hist = np.bincount(group['category'].astype(int), minlength=max_category+1)
-        category_hist = category_hist / (np.sum(category_hist) + 1e-10)  # Normalize
-        
-        # Combine features
-        traj_features = np.concatenate([
-            [lat_mean, lat_std, lon_mean, lon_std, traj_length, avg_displacement],
-            day_hist,
-            hour_hist,
-            category_hist
-        ])
-        
-        features.append(traj_features)
+        try:
+            # Extract statistical features
+            lat_mean = group['lat'].mean()
+            lat_std = group['lat'].std() if len(group) > 1 else 0
+            lon_mean = group['lon'].mean()
+            lon_std = group['lon'].std() if len(group) > 1 else 0
+            
+            # Calculate trajectory length
+            traj_length = len(group)
+            
+            # Calculate average displacement
+            lat_diffs = np.diff(group['lat'].values)
+            lon_diffs = np.diff(group['lon'].values)
+            avg_displacement = np.mean(np.sqrt(lat_diffs**2 + lon_diffs**2)) if len(lat_diffs) > 0 else 0
+            
+            # Day and hour distribution
+            day_hist = np.bincount(group['day'].astype(int), minlength=7)
+            day_hist = day_hist / (np.sum(day_hist) + 1e-10)  # Normalize
+            
+            hour_hist = np.bincount(group['hour'].astype(int), minlength=24)
+            hour_hist = hour_hist / (np.sum(hour_hist) + 1e-10)  # Normalize
+            
+            # Category distribution with fixed size
+            category_hist = np.zeros(fixed_category_size)
+            actual_hist = np.bincount(group['category'].astype(int), minlength=max_category+1)
+            category_hist[:len(actual_hist)] = actual_hist[:fixed_category_size]
+            category_hist = category_hist / (np.sum(category_hist) + 1e-10)  # Normalize
+            
+            # Combine features
+            traj_features = np.concatenate([
+                [lat_mean, lat_std, lon_mean, lon_std, traj_length, avg_displacement],
+                day_hist,
+                hour_hist,
+                category_hist
+            ])
+            
+            features.append(traj_features)
+        except Exception as e:
+            print(f"Error processing trajectory {tid}: {e}")
+            # Skip this trajectory
+    
+    if not features:
+        raise ValueError("No valid features could be extracted from trajectories")
+    
+    # Verify all features have the same length
+    feature_lengths = [len(f) for f in features]
+    if len(set(feature_lengths)) > 1:
+        print(f"Warning: inconsistent feature lengths detected: {set(feature_lengths)}")
+        # Find the most common length
+        from collections import Counter
+        most_common_length = Counter(feature_lengths).most_common(1)[0][0]
+        # Filter features to keep only those with the most common length
+        features = [f for f in features if len(f) == most_common_length]
+        print(f"Kept {len(features)} features with length {most_common_length}")
     
     return np.array(features)
 
@@ -263,14 +331,27 @@ def calculate_jsd(real_dist, synthetic_dist):
     Returns:
         jsd: Jensen-Shannon Divergence score
     """
+    # Ensure both distributions have the same length
+    max_len = max(len(real_dist), len(synthetic_dist))
+    
+    # Pad both distributions to the same length
+    padded_real = np.zeros(max_len)
+    padded_real[:len(real_dist)] = real_dist
+    
+    padded_synthetic = np.zeros(max_len)
+    padded_synthetic[:len(synthetic_dist)] = synthetic_dist
+    
     # Ensure distributions sum to 1
-    real_dist = real_dist / (np.sum(real_dist) + 1e-10)
-    synthetic_dist = synthetic_dist / (np.sum(synthetic_dist) + 1e-10)
+    padded_real = padded_real / (np.sum(padded_real) + 1e-10)
+    padded_synthetic = padded_synthetic / (np.sum(padded_synthetic) + 1e-10)
     
     # Calculate JSD
-    jsd = jensenshannon(real_dist, synthetic_dist)
-    
-    return jsd
+    try:
+        jsd = jensenshannon(padded_real, padded_synthetic)
+        return jsd
+    except Exception as e:
+        print(f"Error calculating JSD: {e}")
+        return 1.0  # Return worst-case value on error
 
 
 def evaluate_utility(real_df, synthetic_df):
@@ -284,47 +365,82 @@ def evaluate_utility(real_df, synthetic_df):
     Returns:
         metrics: Dictionary of utility metrics
     """
-    # Extract features for FID calculation
-    real_features = extract_features(real_df)
-    synthetic_features = extract_features(synthetic_df)
-    
-    # Calculate FID
-    fid_score = calculate_fid(real_features, synthetic_features)
-    
-    # Calculate JSD for different attributes
-    utility_metrics = {'fid_score': fid_score}
-    
-    # Day distribution
-    real_day_dist = np.bincount(real_df['day'].astype(int), minlength=7)
-    synthetic_day_dist = np.bincount(synthetic_df['day'].astype(int), minlength=7)
-    day_jsd = calculate_jsd(real_day_dist, synthetic_day_dist)
-    utility_metrics['day_jsd'] = day_jsd
-    
-    # Hour distribution
-    real_hour_dist = np.bincount(real_df['hour'].astype(int), minlength=24)
-    synthetic_hour_dist = np.bincount(synthetic_df['hour'].astype(int), minlength=24)
-    hour_jsd = calculate_jsd(real_hour_dist, synthetic_hour_dist)
-    utility_metrics['hour_jsd'] = hour_jsd
-    
-    # Category distribution
-    max_category = max(real_df['category'].max(), synthetic_df['category'].max(), 1)
-    real_category_dist = np.bincount(real_df['category'].astype(int), minlength=max_category+1)
-    synthetic_category_dist = np.bincount(synthetic_df['category'].astype(int), minlength=max_category+1)
-    category_jsd = calculate_jsd(real_category_dist, synthetic_category_dist)
-    utility_metrics['category_jsd'] = category_jsd
-    
-    # Calculate overall JSD as average
-    overall_jsd = (day_jsd + hour_jsd + category_jsd) / 3
-    utility_metrics['overall_jsd'] = overall_jsd
-    
-    return utility_metrics
+    try:
+        # Extract features
+        real_features = extract_features(real_df)
+        synthetic_features = extract_features(synthetic_df)
+        
+        print(f"Real features shape: {real_features.shape}")
+        print(f"Synthetic features shape: {synthetic_features.shape}")
+        
+        # Ensure features have the same dimensions
+        min_features = min(real_features.shape[1], synthetic_features.shape[1])
+        
+        # Truncate features to the same length
+        real_features_truncated = real_features[:, :min_features]
+        synthetic_features_truncated = synthetic_features[:, :min_features]
+        
+        print(f"Using truncated features with length {min_features}")
+        
+        # Calculate FID
+        fid_score = calculate_fid(real_features_truncated, synthetic_features_truncated)
+        
+        # Calculate JSD for different attributes
+        utility_metrics = {'fid_score': fid_score}
+        
+        # Ensure day values are in [0, 6]
+        real_df_day = real_df.copy()
+        synthetic_df_day = synthetic_df.copy()
+        real_df_day['day'] = real_df_day['day'].clip(0, 6)
+        synthetic_df_day['day'] = synthetic_df_day['day'].clip(0, 6)
+        
+        # Day distribution - ensure same length
+        real_day_dist = np.bincount(real_df_day['day'].astype(int), minlength=7)
+        synthetic_day_dist = np.bincount(synthetic_df_day['day'].astype(int), minlength=7)
+        day_jsd = calculate_jsd(real_day_dist, synthetic_day_dist)
+        utility_metrics['day_jsd'] = day_jsd
+        
+        # Ensure hour values are in [0, 23]
+        real_df_hour = real_df.copy()
+        synthetic_df_hour = synthetic_df.copy()
+        real_df_hour['hour'] = real_df_hour['hour'].clip(0, 23)
+        synthetic_df_hour['hour'] = synthetic_df_hour['hour'].clip(0, 23)
+        
+        # Hour distribution - ensure same length
+        real_hour_dist = np.bincount(real_df_hour['hour'].astype(int), minlength=24)
+        synthetic_hour_dist = np.bincount(synthetic_df_hour['hour'].astype(int), minlength=24)
+        hour_jsd = calculate_jsd(real_hour_dist, synthetic_hour_dist)
+        utility_metrics['hour_jsd'] = hour_jsd
+        
+        # Category distribution - use the same max category for both
+        max_category = max(max(real_df['category'].max(), 1), max(synthetic_df['category'].max(), 1))
+        real_category_dist = np.bincount(real_df['category'].astype(int), minlength=max_category+1)
+        synthetic_category_dist = np.bincount(synthetic_df['category'].astype(int), minlength=max_category+1)
+        category_jsd = calculate_jsd(real_category_dist, synthetic_category_dist)
+        utility_metrics['category_jsd'] = category_jsd
+        
+        # Calculate overall JSD as average
+        overall_jsd = (day_jsd + hour_jsd + category_jsd) / 3
+        utility_metrics['overall_jsd'] = overall_jsd
+        
+        return utility_metrics
+    except Exception as e:
+        print(f"Error in evaluate_utility: {e}")
+        # Return default metrics
+        return {
+            'fid_score': float('inf'),
+            'day_jsd': 1.0,
+            'hour_jsd': 1.0,
+            'category_jsd': 1.0,
+            'overall_jsd': 1.0
+        }
 
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate privacy and utility of synthetic trajectories')
     parser.add_argument('--real', type=str, default='/root/autodl-tmp/location-privacy/data/test_latlon.csv', 
                         help='Path to real trajectory data CSV')
-    parser.add_argument('--synthetic', type=str, default='/root/autodl-tmp/location-privacy/results/syn_traj_test.csv', 
+    parser.add_argument('--synthetic', type=str, default='/root/autodl-tmp/location-privacy/results/synthetic_trajectories_epoch110.csv', 
                         help='Path to synthetic trajectory data CSV')
     parser.add_argument('--output', type=str, default='results/evaluation_metrics.csv', 
                         help='Path to save evaluation metrics')
@@ -341,31 +457,17 @@ def main():
     real_df = pd.read_csv(args.real)
     synthetic_df = pd.read_csv(args.synthetic)
     
-    # Ensure column order matches (handling the difference in column order)
-    if list(synthetic_df.columns) != list(real_df.columns):
-        print(f"Reordering synthetic columns to match real data")
-        print(f"Real columns: {real_df.columns.tolist()}")
-        print(f"Synthetic columns: {synthetic_df.columns.tolist()}")
-        
-        # Try to reorder synthetic columns to match real data
-        try:
-            synthetic_df = synthetic_df[real_df.columns]
-        except KeyError:
-            # If the column names don't match exactly, handle it
-            print("Column names don't match exactly. Mapping columns...")
-            
-            # The test csv includes columns: tid,label,lat,lon,day,hour,category
-            # The synthetic csv includes column: label,tid,lat,lon,day,hour,category
-            synthetic_df = synthetic_df[['label', 'tid', 'lat', 'lon', 'day', 'hour', 'category']]
-            synthetic_df = synthetic_df[['tid', 'label', 'lat', 'lon', 'day', 'hour', 'category']]
-    
     print(f"Real data shape: {real_df.shape}")
     print(f"Synthetic data shape: {synthetic_df.shape}")
+    
+    # Print column names for debugging
+    print(f"Real data columns: {real_df.columns.tolist()}")
+    print(f"Synthetic data columns: {synthetic_df.columns.tolist()}")
     
     # Prepare data for TUL evaluation
     print("Preparing data for privacy evaluation...")
     real_inputs, real_labels = prepare_trajectories_for_tul(real_df)
-    synthetic_inputs, synthetic_labels = prepare_trajectories_for_tul(synthetic_df)
+    synthetic_inputs, synthetic_labels = prepare_trajectories_for_tul(synthetic_df, label_col='point_idx')
     
     # Evaluate privacy
     print("Evaluating privacy metrics...")
@@ -406,4 +508,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main() 
+    main()

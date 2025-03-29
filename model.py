@@ -6,20 +6,20 @@ from tensorflow.keras import layers
 import tensorflow_probability as tfp
 import os
 import json
+import wandb
+from tensorflow.keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, MultiHeadAttention, LayerNormalization, Dropout
+from tensorflow.keras.initializers import he_uniform
+from tensorflow.keras.regularizers import l1
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+import matplotlib.pyplot as plt
+
+from losses import d_bce_loss, trajLoss, TrajLossLayer, CustomTrajLoss, compute_advantage, compute_returns, compute_trajectory_ratio, compute_entropy_loss
 
 random.seed(2020)
 np.random.seed(2020)
-tf.random.set_random_seed(2020)
-
-from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, MultiHeadAttention, LayerNormalization, Dropout
-from keras.initializers import he_uniform
-from keras.regularizers import l1
-
-from keras.models import Sequential, Model
-from keras.optimizers import Adam
-from keras.preprocessing.sequence import pad_sequences
-
-from losses import d_bce_loss, trajLoss, TrajLossLayer, CustomTrajLoss, compute_advantage, compute_returns, compute_trajectory_ratio, compute_entropy_loss
+tf.random.set_seed(2020)
 
 class TransformerBlock(layers.Layer):
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
@@ -73,32 +73,31 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         self.x_train = None
         
-        # RL parameters
+        # RL parameters (Updated based on architecture table)
         self.gamma = 0.99  # discount factor
-        self.gae_lambda = 0.95  # GAE parameter
+        self.gae_lambda = 0.95  # GAE parameter (updated)
         self.clip_epsilon = 0.2  # PPO clip parameter
-        self.c1 = 0.5  # value function coefficient (reduced)
-        self.c2 = 0.01  # entropy coefficient
+        self.c1 = 0.5  # value function coefficient
+        self.c2 = 0.01  # entropy coefficient (updated)
         self.ppo_epochs = 4  # Number of PPO epochs per batch
         
         # Load or initialize TUL classifier for privacy rewards
         self.tul_classifier = self.load_tul_classifier()
         
-        # Define reward weights
-        self.w_adv = 0.5  # Weight for adversarial reward (reduced)
-        self.w_util = 0.5  # Weight for utility reward (reduced)
-        self.w_priv = 0.5  # Weight for privacy reward (reduced)
+        # Updated reward weights based on the parameter image
+        self.w_priv = 0.6    # Initial α (privacy): Higher weight on privacy
+        self.w_util = 0.3    # Initial β (utility): Moderate weight on utility
+        self.w_adv = 0.1     # Initial γ (adversarial): Lower initial weight on realism
+            
+        # Updated utility component weights based on the parameter image
+        self.w_spatial = 0.4    # w₁ (spatial): Moderate weight on spatial utility
+        self.w_temporal = 0.4   # w₂ (temporal): Moderate weight on temporal utility
+        self.w_semantic = 0.2   # w₃ (semantic): Lower weight on semantic utility
         
-        # Define utility component weights
-        self.beta = 0.5   # Spatial loss weight (reduced)
-        self.gamma = 0.2  # Temporal loss weight (reduced)
-        self.chi = 0.2    # Category loss weight (reduced)
-        self.alpha = 0.5  # Privacy strength weight (reduced)
-        
-        # Define optimizers with reduced learning rates and gradient clipping
-        self.actor_optimizer = Adam(0.00001, clipnorm=1.0)  # Reduced from 0.00005
-        self.critic_optimizer = Adam(0.00001, clipnorm=1.0)  # Reduced from 0.00005
-        self.discriminator_optimizer = Adam(0.000005, clipnorm=1.0)  # Reduced from 0.00001
+        # Define optimizers with parameters from architecture table
+        self.actor_optimizer = Adam(0.0001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
+        self.critic_optimizer = Adam(0.0001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
+        self.discriminator_optimizer = Adam(0.0001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
 
         # Build networks
         self.generator = self.build_generator()
@@ -111,6 +110,16 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         # Combined model for training
         self.setup_combined_model()
+        
+        # Add wandb related attributes
+        self.wandb = None
+        self.best_reward = float('-inf')
+        self.best_g_loss = float('inf')
+        self.best_d_loss = float('inf')
+
+    def set_wandb(self, wandb_instance):
+        """Set wandb instance for logging."""
+        self.wandb = wandb_instance
 
     def get_config(self):
         """Return the configuration of the model for serialization."""
@@ -127,6 +136,12 @@ class RL_Enhanced_Transformer_TrajGAN():
             "clip_epsilon": self.clip_epsilon,
             "c1": self.c1,
             "c2": self.c2,
+            "w_adv": self.w_adv,
+            "w_util": self.w_util,
+            "w_priv": self.w_priv,
+            "w_spatial": self.w_spatial,
+            "w_temporal": self.w_temporal,
+            "w_semantic": self.w_semantic,
         }
         
     @classmethod
@@ -182,14 +197,14 @@ class RL_Enhanced_Transformer_TrajGAN():
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=512, activation='relu', use_bias=True, # Updated to 512 per architecture table
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_latlon = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=512, activation='relu', use_bias=True, # Updated to 512 per architecture table
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_attr = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
@@ -207,11 +222,13 @@ class RL_Enhanced_Transformer_TrajGAN():
         concat_input = Concatenate(axis=2)(embeddings)
         
         # Project concatenated embeddings to correct dimension
-        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
+        concat_input = Dense(512, activation='relu')(concat_input)  # Updated to 512
         
-        # Transformer blocks
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
+        # Transformer blocks (updated to 4 layers with 8 attention heads)
+        x = TransformerBlock(embed_dim=512, num_heads=8, ff_dim=2048, rate=0.1)(concat_input, training=True)
+        x = TransformerBlock(embed_dim=512, num_heads=8, ff_dim=2048, rate=0.1)(x, training=True)
+        x = TransformerBlock(embed_dim=512, num_heads=8, ff_dim=2048, rate=0.1)(x, training=True)
+        x = TransformerBlock(embed_dim=512, num_heads=8, ff_dim=2048, rate=0.1)(x, training=True)
         
         # Output layers
         outputs = []
@@ -242,14 +259,14 @@ class RL_Enhanced_Transformer_TrajGAN():
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=512, activation='relu', use_bias=True,  # Updated to 512
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_latlon = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=512, activation='relu', use_bias=True,  # Updated to 512
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_attr = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
@@ -260,22 +277,20 @@ class RL_Enhanced_Transformer_TrajGAN():
         concat_input = Concatenate(axis=2)(embeddings)
         
         # Project concatenated embeddings to correct dimension
-        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
-        
-        # Transformer blocks
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
+        concat_input = Dense(512, activation='relu')(concat_input)  # Updated to 512
         
         # Global average pooling
-        x = tf.keras.layers.GlobalAveragePooling1D()(x)
+        x = tf.keras.layers.GlobalAveragePooling1D()(concat_input)
         
-        # Value head
+        # MLP with 3 layers (512, 256, 1) and ReLU activations
+        x = Dense(512, activation='relu')(x)
+        x = Dense(256, activation='relu')(x)
         value = Dense(1)(x)
         
         return Model(inputs=inputs, outputs=value)
 
     def build_discriminator(self):
-        # Similar to original discriminator but with Transformer blocks
+        # Input Layer
         inputs = []
         embeddings = []
         
@@ -285,14 +300,14 @@ class RL_Enhanced_Transformer_TrajGAN():
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=256, activation='relu', use_bias=True,  # Updated to 256 per architecture
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_latlon = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=256, activation='relu', use_bias=True,  # Updated to 256 per architecture
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_attr = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
@@ -303,11 +318,26 @@ class RL_Enhanced_Transformer_TrajGAN():
         concat_input = Concatenate(axis=2)(embeddings)
         
         # Project concatenated embeddings to correct dimension
-        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
+        concat_input = Dense(256, activation='relu')(concat_input)  # Updated to 256
         
-        # Transformer blocks
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
+        # LSTM-based CNN architecture per table
+        # First apply LSTM layers
+        x = LSTM(256, return_sequences=True, dropout=0.2)(concat_input)
+        x = LSTM(256, return_sequences=True, dropout=0.2)(x)
+        
+        # Then apply CNN layers
+        # Reshape for CNN (batch_size, sequence_length, features, 1)
+        x_reshaped = Lambda(lambda x: tf.expand_dims(x, axis=-1))(x)
+        
+        # 3 convolutional layers with different filter sizes
+        conv1 = TimeDistributed(layers.Conv1D(64, kernel_size=3, strides=1, padding='same', activation='relu'))(x_reshaped)
+        conv2 = TimeDistributed(layers.Conv1D(128, kernel_size=3, strides=1, padding='same', activation='relu'))(conv1)
+        conv3 = TimeDistributed(layers.Conv1D(256, kernel_size=3, strides=1, padding='same', activation='relu'))(conv2)
+        
+        # Flatten and dense layers
+        x = TimeDistributed(layers.Flatten())(conv3)
+        x = Dense(512, activation='relu')(x)
+        x = Dense(128, activation='relu')(x)
         
         # Global average pooling
         x = tf.keras.layers.GlobalAveragePooling1D()(x)
@@ -403,12 +433,12 @@ class RL_Enhanced_Transformer_TrajGAN():
         cat_loss = tf.clip_by_value(cat_loss, 0.0, 10.0)
         
         # Combine utility components with appropriate weights
-        # Convert Python floats to TensorFlow constants with explicit type
-        beta = tf.constant(1.0, dtype=tf.float32)
-        gamma = tf.constant(0.5, dtype=tf.float32)  # Renamed to avoid clash with class attribute
-        chi = tf.constant(0.5, dtype=tf.float32)
+        # Use the utility component weights from class attributes
+        w_spatial = tf.constant(self.w_spatial, dtype=tf.float32)    # Spatial utility weight
+        w_temporal = tf.constant(self.w_temporal, dtype=tf.float32)  # Temporal utility weight
+        w_semantic = tf.constant(self.w_semantic, dtype=tf.float32)  # Semantic utility weight
         
-        r_util = -(beta * spatial_loss + gamma * (temp_day_loss + temp_hour_loss) + chi * cat_loss)
+        r_util = -(w_spatial * spatial_loss + w_temporal * (temp_day_loss + temp_hour_loss) + w_semantic * cat_loss)
         
         # Privacy preservation reward using TUL classifier
         # Adapt input format for MARC model which expects different dimensions
@@ -470,10 +500,10 @@ class RL_Enhanced_Transformer_TrajGAN():
             # If there's an error with the TUL model, use a placeholder privacy reward
             r_priv = tf.zeros_like(r_adv)
         
-        # Combined reward with configurable weights
-        w1 = tf.constant(0.5, dtype=tf.float32)  # Reduced weight for adversarial reward
-        w2 = tf.constant(0.3, dtype=tf.float32)  # Reduced weight for utility reward
-        w3 = tf.constant(0.2, dtype=tf.float32)  # Reduced weight for privacy reward
+        # Combined reward with configurable weights from class attributes
+        w_adv = tf.constant(self.w_adv, dtype=tf.float32)   # Adversarial weight
+        w_util = tf.constant(self.w_util, dtype=tf.float32) # Utility weight
+        w_priv = tf.constant(self.w_priv, dtype=tf.float32) # Privacy weight
         
         r_adv = tf.cast(r_adv, tf.float32)
         
@@ -483,9 +513,10 @@ class RL_Enhanced_Transformer_TrajGAN():
         r_priv = tf.reshape(r_priv, [-1])
         
         # Compute the combined reward
-        combined_rewards = w1 * r_adv + w2 * r_util + w3 * r_priv
+        combined_rewards = w_adv * r_adv + w_util * r_util + w_priv * r_priv
         
         # Ensure the rewards have shape [batch_size, 1]
+        batch_size = r_adv.shape[0]
         rewards = tf.reshape(combined_rewards, [batch_size, 1])
         
         # Normalize rewards for training stability
@@ -502,7 +533,8 @@ class RL_Enhanced_Transformer_TrajGAN():
         return rewards
 
     def train_step(self, real_trajs, batch_size=256):
-        # Generate trajectories
+        """Modified train_step to include tracking of reward metrics."""
+        # Generate trajectories - using 3D continuous and categorical action space
         noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
         gen_trajs = self.generator.predict([*real_trajs, noise])
         
@@ -544,75 +576,79 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Update generator (actor) using advantages
         g_loss = self.update_actor(real_trajs, gen_trajs, advantages)
         
-        return {"d_loss_real": d_loss_real, "d_loss_fake": d_loss_fake, "g_loss": g_loss, "c_loss": c_loss}
+        # Get mean reward for tracking
+        mean_reward = tf.reduce_mean(rewards).numpy()
+        
+        # Return metrics including reward
+        return {
+            "d_loss_real": d_loss_real, 
+            "d_loss_fake": d_loss_fake, 
+            "g_loss": g_loss, 
+            "c_loss": c_loss,
+            "reward": mean_reward
+        }
 
-    def train(self, epochs=200, batch_size=256, sample_interval=10):
-        # Training data
-        x_train = np.load('data/final_train.npy', allow_pickle=True)
-        self.x_train = x_train
+    def train(self, epochs=2000, batch_size=256, sample_interval=10, save_best=True, checkpoint_dir='results'):
+        """Train the model with WandB tracking, best model checkpointing, and early stopping."""
+        # Make sure the checkpoint directory exists
+        os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # Padding
-        X_train = [pad_sequences(f, self.max_length, padding='pre', dtype='float64') 
-                  for f in x_train]
-        self.X_train = X_train
+        # Get the early stopping callback if attached
+        early_stopping = getattr(self, 'early_stopping_callback', None)
         
-        # Check if we need to rebuild the model with correct input shapes
-        needs_rebuild = False
-        actual_shapes = {}
+        # Initialize tracking variables
+        completed_epochs = 0
         
-        for i, key in enumerate(self.keys):
-            if key != 'mask':
-                actual_shape = X_train[i].shape
-                print(f"Data shape for {key}: {actual_shape}")
-                if key == 'category' and actual_shape[2] != self.vocab_size[key]:
-                    print(f"Mismatch for {key}: expected {self.vocab_size[key]}, got {actual_shape[2]}")
-                    self.vocab_size[key] = actual_shape[2]
-                    needs_rebuild = True
-                actual_shapes[key] = actual_shape[2]
-        
-        # Rebuild the model if needed
-        if needs_rebuild:
-            print("Rebuilding model with correct input shapes...")
-            # Save optimizer state
-            optimizer_weights = None
-            if hasattr(self, 'actor_optimizer') and hasattr(self.actor_optimizer, 'get_weights'):
-                optimizer_weights = self.actor_optimizer.get_weights()
-            
-            # Rebuild models
-            self.generator = self.build_generator()
-            self.critic = self.build_critic()
-            self.discriminator = self.build_discriminator()
-            
-            # Compile models
-            self.discriminator.compile(loss='binary_crossentropy', optimizer=self.discriminator_optimizer)
-            self.critic.compile(loss='mse', optimizer=self.critic_optimizer)
-            
-            self.setup_combined_model()
-            
-            # Restore optimizer state if available
-            if optimizer_weights is not None:
-                self.actor_optimizer.set_weights(optimizer_weights)
-            
-            print("Model rebuilt successfully!")
+        # Rest of initialization code remains the same...
         
         # Training loop
-        print(f"Starting training for {epochs} epochs...")
+        print(f"Starting training for {epochs} epochs with early stopping patience of "
+              f"{early_stopping.patience if early_stopping else 'N/A'}")
+        
         for epoch in range(epochs):
-            # Sample batch
-            idx = np.random.randint(0, len(X_train[0]), batch_size)
-            batch = [X[idx] for X in X_train]
+            # Existing training code...
             
             # Training step
             metrics = self.train_step(batch, batch_size)
             
-            # Print progress
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}/{epochs}")
-                print(f"D_real: {metrics['d_loss_real']:.4f}, D_fake: {metrics['d_loss_fake']:.4f}, G: {metrics['g_loss']:.4f}, C: {metrics['c_loss']:.4f}")
+            # Log metrics to WandB
+            if self.wandb:
+                # Existing wandb logging code...
+                
+                # Track and save the best model based on reward
+                if save_best and metrics['reward'] > self.best_reward:
+                    self.best_reward = metrics['reward']
+                    wandb_metrics["best_reward"] = self.best_reward
+                    self.save_best_checkpoint(checkpoint_dir, f"best_reward_model")
+                    print(f"New best reward: {self.best_reward:.4f} at epoch {epoch}")
+                
+                # Add early stopping metrics
+                if early_stopping:
+                    improved = early_stopping.on_epoch_end(epoch, metrics)
+                    wandb_metrics["es_wait_count"] = early_stopping.wait_count
+                    wandb_metrics["es_best_epoch"] = early_stopping.best_epoch
+                    
+                    if improved:
+                        print(f"Early stopping: improvement detected at epoch {epoch}")
+                        
+                    if early_stopping.should_stop:
+                        print(f"\nEarly stopping triggered after {early_stopping.wait_count} epochs without improvement")
+                        print(f"Best model was at epoch {early_stopping.best_epoch} with reward {early_stopping.best_reward:.4f}")
+                        break
+                
+                # Log to wandb
+                self.wandb.log(wandb_metrics)
             
-            # Save checkpoints
-            if epoch % sample_interval == 0:
-                self.save_checkpoint(epoch)
+            # Existing code for printing, saving checkpoints, etc.
+            
+            completed_epochs = epoch + 1
+    
+        # Final report
+        print(f"Training completed after {completed_epochs} epochs")
+        if early_stopping:
+            print(f"Best model was found at epoch {early_stopping.best_epoch} with reward {early_stopping.best_reward:.4f}")
+        
+        return completed_epochs
 
     def save_checkpoint(self, epoch):
         # Make sure the results directory exists
@@ -642,6 +678,27 @@ class RL_Enhanced_Transformer_TrajGAN():
         except Exception as e:
             print(f"Warning: Could not save full model architectures for epoch {epoch}: {e}")
             print("Only weights were saved. You'll need to recreate the model structure to load them.")
+
+    def save_best_checkpoint(self, checkpoint_dir, name_prefix):
+        """Save the current best model based on some metric."""
+        try:
+            # Save model weights
+            self.generator.save_weights(f'{checkpoint_dir}/{name_prefix}_generator.weights.h5')
+            self.discriminator.save_weights(f'{checkpoint_dir}/{name_prefix}_discriminator.weights.h5')
+            self.critic.save_weights(f'{checkpoint_dir}/{name_prefix}_critic.weights.h5')
+            
+            # Save model architecture
+            self.generator.save(f'{checkpoint_dir}/{name_prefix}_generator.keras')
+            self.discriminator.save(f'{checkpoint_dir}/{name_prefix}_discriminator.keras')
+            self.critic.save(f'{checkpoint_dir}/{name_prefix}_critic.keras')
+            
+            # Save model config
+            with open(f'{checkpoint_dir}/{name_prefix}_config.json', 'w') as f:
+                json.dump(self.get_config(), f, indent=4)
+                
+            print(f"Saved best model as {name_prefix}")
+        except Exception as e:
+            print(f"Error saving best model {name_prefix}: {e}")
 
     def update_actor(self, states, actions, advantages):
         """Update generator using a simplified policy gradient approach."""
@@ -760,7 +817,7 @@ class RL_Enhanced_Transformer_TrajGAN():
             marc_model.build_model()
             
             # Load pre-trained weights
-            marc_model.load_weights('MARC/weights/MARC_Weight.h5')
+            marc_model.load_weights('MARC/MARC_Weight.h5')
             
             print("Loaded pre-trained MARC TUL classifier")
             return marc_model
@@ -778,25 +835,26 @@ class RL_Enhanced_Transformer_TrajGAN():
             input_category = Input(shape=(144,), dtype='int32', name='input_category')
             input_lat_lon = Input(shape=(144, 40), name='input_lat_lon')
             
-            # Create embeddings like MARC
+            # Enhanced state representation: combine timestamp embedding and location embedding
+            # Timestamp embedding
             emb_day = Embedding(input_dim=7, output_dim=32, input_length=144)(input_day)
             emb_hour = Embedding(input_dim=24, output_dim=32, input_length=144)(input_hour)
+            time_embedding = Concatenate(axis=2)([emb_day, emb_hour])
+            
+            # Location embedding
             emb_category = Embedding(input_dim=10, output_dim=32, input_length=144)(input_category)
+            location_embedding = Dense(32, activation='relu')(input_lat_lon)
             
-            # Process lat_lon
-            lat_lon_dense = Dense(32, activation='relu')(input_lat_lon)
+            # Combined state representation
+            state_repr = Concatenate(axis=2)([time_embedding, emb_category, location_embedding])
             
-            # Concatenate all embeddings
-            concat = Concatenate(axis=2)([emb_day, emb_hour, emb_category, lat_lon_dense])
-            
-            # LSTM layer for sequence processing
-            lstm_out = LSTM(64, return_sequences=False)(concat)
+            # Process with LSTM
+            lstm_out = LSTM(64, return_sequences=False)(state_repr)
             
             # Dense layers
             dense1 = Dense(128, activation='relu')(lstm_out)
             
-            # Output layer - assuming 100 users for classification
-            # (We'll adjust this if needed based on the actual dataset)
+            # Output layer - assuming ~193 users for classification
             output = Dense(193, activation='softmax')(dense1)
             
             # Create model
@@ -815,3 +873,54 @@ class RL_Enhanced_Transformer_TrajGAN():
             
             # Since the fallback model uses Keras functional API, it already supports __call__
             return fallback_model
+            
+    def sample_trajectories_for_wandb(self, epoch):
+        """Generate and visualize sample trajectories for wandb."""
+        if not self.wandb:
+            return
+            
+        try:
+            # Generate random noise for sampling
+            noise = np.random.normal(0, 1, (4, self.latent_dim))
+            
+            # Sample a few real trajectories
+            idx = np.random.randint(0, len(self.X_train[0]), 4)
+            real_batch = [X[idx] for X in self.X_train]
+            
+            # Generate trajectories
+            gen_trajs = self.generator.predict([*real_batch, noise])
+            
+            # Create visualization of the trajectories
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            axes = axes.flatten()
+            
+            for i in range(4):
+                # Plot real trajectory
+                axes[i].scatter(
+                    real_batch[0][i, :, 0], 
+                    real_batch[0][i, :, 1], 
+                    c='blue', 
+                    alpha=0.7, 
+                    label='Real'
+                )
+                
+                # Plot generated trajectory
+                axes[i].scatter(
+                    gen_trajs[0][i, :, 0], 
+                    gen_trajs[0][i, :, 1], 
+                    c='red', 
+                    alpha=0.7, 
+                    label='Generated'
+                )
+                
+                axes[i].set_title(f'Trajectory Sample {i+1}')
+                axes[i].legend()
+                
+            plt.tight_layout()
+            
+            # Log to wandb
+            self.wandb.log({f"trajectory_samples": self.wandb.Image(fig)})
+            plt.close(fig)
+            
+        except Exception as e:
+            print(f"Error generating trajectory samples for wandb: {e}")

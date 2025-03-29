@@ -1,0 +1,24 @@
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_setup.py:_flush():67] Current SDK version is 0.19.8
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_setup.py:_flush():67] Configure stats pid to 7329
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_setup.py:_flush():67] Loading settings from /root/.config/wandb/settings
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_setup.py:_flush():67] Loading settings from /root/autodl-tmp/location-privacy/wandb/settings
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_setup.py:_flush():67] Loading settings from environment variables
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_init.py:setup_run_log_directory():647] Logging user logs to /root/autodl-tmp/location-privacy/wandb/run-20250328_004008-b63eudx3/logs/debug.log
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_init.py:setup_run_log_directory():648] Logging internal logs to /root/autodl-tmp/location-privacy/wandb/run-20250328_004008-b63eudx3/logs/debug-internal.log
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_init.py:init():761] calling init triggers
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_init.py:init():766] wandb.init called with sweep_config: {}
+config: {'architecture': 'RL_Enhanced_Transformer_TrajGAN', 'epochs': 2000, 'batch_size': 256, 'latent_dim': 100, 'max_length': 144, 'rl_params': {'gamma': 0.99, 'gae_lambda': 0.95, 'clip_epsilon': 0.2, 'ppo_epochs': 4}, 'reward_weights': {'adversarial': 0.5, 'utility': 0.5, 'privacy': 0.5}, '_wandb': {}}
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_init.py:init():784] starting backend
+2025-03-28 00:40:08,807 INFO    MainThread:7329 [wandb_init.py:init():788] sending inform_init request
+2025-03-28 00:40:08,809 INFO    MainThread:7329 [backend.py:_multiprocessing_setup():101] multiprocessing start_methods=fork,spawn,forkserver, using: spawn
+2025-03-28 00:40:08,809 INFO    MainThread:7329 [wandb_init.py:init():798] backend started and connected
+2025-03-28 00:40:08,811 INFO    MainThread:7329 [wandb_init.py:init():891] updated telemetry
+2025-03-28 00:40:08,816 INFO    MainThread:7329 [wandb_init.py:init():915] communicating run to backend with 90.0 second timeout
+2025-03-28 00:40:09,478 ERROR   MainThread:7329 [wandb_init.py:init():1478] error in wandb.init()
+Traceback (most recent call last):
+  File "/root/miniconda3/lib/python3.10/site-packages/wandb/sdk/wandb_init.py", line 1468, in init
+    return wi.init(run_settings, run_config)
+  File "/root/miniconda3/lib/python3.10/site-packages/wandb/sdk/wandb_init.py", line 963, in init
+    raise error
+wandb.errors.errors.CommError: failed to upsert bucket: returned error 403: {"data":{"upsertBucket":null},"errors":[{"message":"permission denied","path":["upsertBucket"],"extensions":{"code":"PERMISSION_ERROR"}}]}
+2025-03-28 00:40:10,479 INFO    MsgRouterThr:7329 [mailbox.py:close():129] Closing mailbox, abandoning 0 handles.

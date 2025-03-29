@@ -1,0 +1,16 @@
+{"time":"2025-03-28T03:55:54.760782025+08:00","level":"INFO","msg":"stream: starting","core version":"0.19.8","symlink path":"/root/autodl-tmp/location-privacy/wandb/run-20250328_035554-6ke44gj2/logs/debug-core.log"}
+{"time":"2025-03-28T03:55:54.865048046+08:00","level":"INFO","msg":"created new stream","id":"6ke44gj2"}
+{"time":"2025-03-28T03:55:54.865101501+08:00","level":"INFO","msg":"stream: started","id":"6ke44gj2"}
+{"time":"2025-03-28T03:55:54.865144638+08:00","level":"INFO","msg":"writer: Do: started","stream_id":"6ke44gj2"}
+{"time":"2025-03-28T03:55:54.86602379+08:00","level":"INFO","msg":"handler: started","stream_id":"6ke44gj2"}
+{"time":"2025-03-28T03:55:54.866080275+08:00","level":"INFO","msg":"sender: started","stream_id":"6ke44gj2"}
+{"time":"2025-03-28T03:55:55.497449891+08:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-03-28T03:59:29.724209298+08:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-03-28T03:59:29.7248724+08:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-03-28T03:59:30.726441615+08:00","level":"INFO","msg":"handler: operation stats","stats":{"operations":[{"desc":"uploading checkpoints/best_early_stopping_model_critic.keras","runtime_seconds":0.453461119,"progress":"288.0KB/5.5MB"},{"desc":"uploading checkpoints/best_early_stopping_model_discriminator.weights.h5","runtime_seconds":0.45344417,"progress":"112.0KB/5.3MB"},{"desc":"uploading checkpoints/best_early_stopping_model_discriminator.keras","runtime_seconds":0.45344171,"progress":"32.0KB/5.5MB"},{"desc":"uploading wandb-summary.json","runtime_seconds":0.45343984,"progress":"1.5KB/1.5KB"},{"desc":"uploading checkpoints/best_early_stopping_model_generator.keras","runtime_seconds":0.453435561,"progress":"128.0KB/2.1MB"},{"desc":"uploading checkpoints/best_early_stopping_model_config.json","runtime_seconds":0.453433241,"progress":"500B/500B"},{"desc":"uploading checkpoints/best_early_stopping_model_critic.weights.h5","runtime_seconds":0.453414432,"progress":"48.0KB/5.3MB"},{"desc":"uploading checkpoints/best_early_stopping_model_generator.weights.h5","runtime_seconds":0.453412343,"progress":"160.0KB/1.9MB"},{"desc":"uploading output.log","runtime_seconds":0.453408703,"progress":"21.5KB/21.5KB"},{"desc":"uploading config.yaml","runtime_seconds":0.183458959}],"total_operations":10}}
+{"time":"2025-03-28T03:59:55.078833172+08:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-03-28T03:59:55.651816208+08:00","level":"INFO","msg":"stream: closing","id":"6ke44gj2"}
+{"time":"2025-03-28T03:59:55.651836946+08:00","level":"INFO","msg":"handler: closed","stream_id":"6ke44gj2"}
+{"time":"2025-03-28T03:59:55.651843955+08:00","level":"INFO","msg":"writer: Close: closed","stream_id":"6ke44gj2"}
+{"time":"2025-03-28T03:59:55.651879132+08:00","level":"INFO","msg":"sender: closed","stream_id":"6ke44gj2"}
+{"time":"2025-03-28T03:59:55.651954855+08:00","level":"INFO","msg":"stream: closed","id":"6ke44gj2"}

@@ -1,0 +1,89 @@
+Loading data statistics...
+/root/miniconda3/lib/python3.10/site-packages/keras/src/layers/core/embedding.py:90: UserWarning: Argument `input_length` is deprecated. Just remove it.
+  warnings.warn(
+Error loading MARC model: [Errno 2] Unable to synchronously open file (unable to open file: name = 'MARC/weights/MARC_Weight.h5', errno = 2, error message = 'No such file or directory', flags = 0, o_flags = 0)
+Creating a fallback TUL classifier model
+Created fallback TUL classifier model with matching input format
+Data shape for lat_lon: (2052, 144, 2)
+Data shape for day: (2052, 144, 7)
+Data shape for hour: (2052, 144, 24)
+Data shape for category: (2052, 144, 10)
+Mismatch for category: expected 2052, got 10
+Rebuilding model with correct input shapes...
+Model rebuilt successfully!
+Starting training for 2000 epochs with early stopping (patience=20)...
+[1m8/8[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 46ms/step
+[1m8/8[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 50ms/step
+Input shapes - Day: (256, 144), Hour: (256, 144), Category: (256, 144), Lat_lon: (256, 144, 40)
+Day range: [0, 6]
+TUL predictions shape: (256, 193)
+Rewards shape: (256, 1), min: -2.8485159873962402, max: 1.6018894910812378, mean: -3.296881914138794e-07
+[1m8/8[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 58ms/step
+Traceback (most recent call last):
+  File "/root/autodl-tmp/location-privacy/train.py", line 392, in <module>
+    main()
+  File "/root/autodl-tmp/location-privacy/train.py", line 371, in main
+    best_epoch, best_reward = model.train(
+  File "/root/autodl-tmp/location-privacy/train.py", line 368, in <lambda>
+    model.train = lambda *args, **kwargs: train_with_early_stopping(model, *args, **kwargs)
+  File "/root/autodl-tmp/location-privacy/train.py", line 179, in train_with_early_stopping
+    metrics = self.train_step(batch, batch_size)
+  File "/root/autodl-tmp/location-privacy/model.py", line 543, in train_step
+    c_loss = self.critic.train_on_batch(real_trajs[:4], returns)
+  File "/root/miniconda3/lib/python3.10/site-packages/keras/src/backend/tensorflow/trainer.py", line 599, in train_on_batch
+    logs = self.train_function(data())
+  File "/root/miniconda3/lib/python3.10/site-packages/keras/src/backend/tensorflow/trainer.py", line 227, in function
+    outputs = one_step_on_data(data)
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/util/traceback_utils.py", line 150, in error_handler
+    return fn(*args, **kwargs)
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/polymorphic_function.py", line 833, in __call__
+    result = self._call(*args, **kwds)
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/polymorphic_function.py", line 906, in _call
+    return tracing_compilation.call_function(
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/tracing_compilation.py", line 139, in call_function
+    return function._call_flat(  # pylint: disable=protected-access
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/concrete_function.py", line 1322, in _call_flat
+    return self._inference_function.call_preflattened(args)
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/atomic_function.py", line 216, in call_preflattened
+    flat_outputs = self.call_flat(*args)
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/atomic_function.py", line 251, in call_flat
+    outputs = self._bound_context.call_function(
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/context.py", line 1688, in call_function
+    outputs = execute.execute(
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/execute.py", line 53, in quick_execute
+    tensors = pywrap_tfe.TFE_Py_Execute(ctx._handle, device_name, op_name,
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/root/autodl-tmp/location-privacy/train.py", line 392, in <module>
+    main()
+  File "/root/autodl-tmp/location-privacy/train.py", line 371, in main
+    best_epoch, best_reward = model.train(
+  File "/root/autodl-tmp/location-privacy/train.py", line 368, in <lambda>
+    model.train = lambda *args, **kwargs: train_with_early_stopping(model, *args, **kwargs)
+  File "/root/autodl-tmp/location-privacy/train.py", line 179, in train_with_early_stopping
+    metrics = self.train_step(batch, batch_size)
+  File "/root/autodl-tmp/location-privacy/model.py", line 543, in train_step
+    c_loss = self.critic.train_on_batch(real_trajs[:4], returns)
+  File "/root/miniconda3/lib/python3.10/site-packages/keras/src/backend/tensorflow/trainer.py", line 599, in train_on_batch
+    logs = self.train_function(data())
+  File "/root/miniconda3/lib/python3.10/site-packages/keras/src/backend/tensorflow/trainer.py", line 227, in function
+    outputs = one_step_on_data(data)
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/util/traceback_utils.py", line 150, in error_handler
+    return fn(*args, **kwargs)
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/polymorphic_function.py", line 833, in __call__
+    result = self._call(*args, **kwds)
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/polymorphic_function.py", line 906, in _call
+    return tracing_compilation.call_function(
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/tracing_compilation.py", line 139, in call_function
+    return function._call_flat(  # pylint: disable=protected-access
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/concrete_function.py", line 1322, in _call_flat
+    return self._inference_function.call_preflattened(args)
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/atomic_function.py", line 216, in call_preflattened
+    flat_outputs = self.call_flat(*args)
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/polymorphic_function/atomic_function.py", line 251, in call_flat
+    outputs = self._bound_context.call_function(
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/context.py", line 1688, in call_function
+    outputs = execute.execute(
+  File "/root/miniconda3/lib/python3.10/site-packages/tensorflow/python/eager/execute.py", line 53, in quick_execute
+    tensors = pywrap_tfe.TFE_Py_Execute(ctx._handle, device_name, op_name,
+KeyboardInterrupt
