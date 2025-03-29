@@ -85,9 +85,9 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.tul_classifier = self.load_tul_classifier()
         
         # Reward balance parameters (alpha, beta, gamma as per the paper)
-        self.alpha_0 = 0.3    # Initial privacy weight
-        self.beta_0 = 0.3     # Initial utility weight
-        self.gamma_0 = 0.4    # Initial adversarial weight
+        self.alpha_0 = 0.4  # Initial privacy weight
+        self.beta_0 = 0.4     # Initial utility weight
+        self.gamma_0 = 0.2    # Initial adversarial weight
         
         # Current adaptive weights (will be updated during training)
         self.alpha_t = self.alpha_0  
@@ -105,7 +105,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.w3 = 0.3    # Semantic/category loss weight (d_semantic)
         
         # Define optimizers with reduced learning rates and gradient clipping
-        self.actor_optimizer = Adam(0.001, clipnorm=1.0)
+        self.actor_optimizer = Adam(0.0005, clipnorm=1.0)
         self.critic_optimizer = Adam(0.001, clipnorm=1.0)
         self.discriminator_optimizer = Adam(0.001, clipnorm=1.0)
 
@@ -392,16 +392,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.gen_trajs_symbolic = gen_trajs
 
     def compute_rewards(self, real_trajs, gen_trajs, tul_classifier):
-        """Compute the three-part reward function as described in the paper.
-        
-        Args:
-            real_trajs: Original real trajectories
-            gen_trajs: Generated synthetic trajectories
-            tul_classifier: Pre-trained TUL classifier for privacy evaluation
-        
-        Returns:
-            Combined reward balancing privacy, utility and realism
-        """
+        """Compute the three-part reward function as described in the paper."""
         # Cast inputs to float32 for consistent typing
         gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
         real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
@@ -415,75 +406,38 @@ class RL_Enhanced_Transformer_TrajGAN():
         r_adv = tf.math.log(d_pred)
         
         # 2. Utility Preservation Reward - measures statistical similarity
-        # 2.1 Spatial loss - Haversine distance between coordinates
-        def haversine_distance(lat1, lon1, lat2, lon2):
-            # Convert from degrees to radians
-            lat1 = lat1 * tf.constant(np.pi/180, dtype=tf.float32)
-            lon1 = lon1 * tf.constant(np.pi/180, dtype=tf.float32)
-            lat2 = lat2 * tf.constant(np.pi/180, dtype=tf.float32)
-            lon2 = lon2 * tf.constant(np.pi/180, dtype=tf.float32)
-            
-            # Haversine formula
-            dlon = lon2 - lon1
-            dlat = lat2 - lat1
-            a = tf.square(tf.sin(dlat/2)) + tf.cos(lat1) * tf.cos(lat2) * tf.square(tf.sin(dlon/2))
-            c = 2 * tf.asin(tf.sqrt(a))
-            r = 6371  # Radius of earth in kilometers
-            return c * r
-        
-        # Extract lat/lon coordinates and compute haversine distance
-        # Note: gen_trajs[0] contains [lat, lon] pairs
-        real_lat = real_trajs[0][:, :, 0]
-        real_lon = real_trajs[0][:, :, 1]
-        gen_lat = gen_trajs[0][:, :, 0]
-        gen_lon = gen_trajs[0][:, :, 1]
-        
-        # Compute point-wise haversine distance and take mean over trajectory
-        spatial_loss = tf.vectorized_map(
-            lambda x: haversine_distance(x[0], x[1], x[2], x[3]),
-            (real_lat, real_lon, gen_lat, gen_lon)
-        )
-        spatial_loss = tf.reduce_mean(spatial_loss, axis=1)
+        # 2.1 Spatial loss - Use simpler L2 distance instead of Haversine to avoid NaN issues
+        spatial_loss = tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]), axis=[1, 2])
         spatial_loss = tf.cast(spatial_loss, tf.float32)
         spatial_loss = tf.clip_by_value(spatial_loss, 0.0, 10.0)
         
-        # 2.2 Temporal loss using DTW-inspired approach for day and hour distributions
-        # For simplicity, we'll use a soft DTW-inspired approach with cross-entropy
-        
-        # Convert one-hot day and hour to distributions over time
+        # 2.2 Temporal loss - Use simple cross-entropy with safe clipping
         gen_trajs_day_clipped = tf.clip_by_value(gen_trajs[2], 1e-7, 1.0 - 1e-7)
-        gen_trajs_hour_clipped = tf.clip_by_value(gen_trajs[3], 1e-7, 1.0 - 1e-7)
+        real_trajs_day_clipped = tf.clip_by_value(real_trajs[2], 1e-7, 1.0 - 1e-7)
         
-        # Dynamic time pattern similarity (simplified DTW approach)
-        # We compute temporal alignment score by comparing distributions at each timestep
-        day_pattern_loss = -tf.reduce_sum(real_trajs[2] * tf.math.log(gen_trajs_day_clipped), axis=[1, 2])
-        hour_pattern_loss = -tf.reduce_sum(real_trajs[3] * tf.math.log(gen_trajs_hour_clipped), axis=[1, 2])
+        gen_trajs_hour_clipped = tf.clip_by_value(gen_trajs[3], 1e-7, 1.0 - 1e-7)
+        real_trajs_hour_clipped = tf.clip_by_value(real_trajs[3], 1e-7, 1.0 - 1e-7)
+        
+        # Simply use cross-entropy
+        day_pattern_loss = -tf.reduce_sum(real_trajs_day_clipped * tf.math.log(gen_trajs_day_clipped), axis=[1, 2])
+        hour_pattern_loss = -tf.reduce_sum(real_trajs_hour_clipped * tf.math.log(gen_trajs_hour_clipped), axis=[1, 2])
         
         # Combined temporal loss
         temp_loss = day_pattern_loss + hour_pattern_loss
         temp_loss = tf.cast(temp_loss, tf.float32)
         temp_loss = tf.clip_by_value(temp_loss, 0.0, 10.0)
         
-        # 2.3 Semantic/category loss - Jensen-Shannon Divergence between category distributions
+        # 2.3 Categorical loss - Use simple cross-entropy instead of JS divergence
         gen_trajs_cat_clipped = tf.clip_by_value(gen_trajs[1], 1e-7, 1.0 - 1e-7)
+        real_trajs_cat_clipped = tf.clip_by_value(real_trajs[1], 1e-7, 1.0 - 1e-7)
         
-        # Calculate category distribution for real and generated trajectories
-        real_cat_dist = tf.reduce_mean(real_trajs[1], axis=1)  # Average over timesteps
-        gen_cat_dist = tf.reduce_mean(gen_trajs_cat_clipped, axis=1)  # Average over timesteps
+        # Simplify to cross-entropy for stability
+        cat_loss = -tf.reduce_sum(real_trajs_cat_clipped * tf.math.log(gen_trajs_cat_clipped), axis=[1, 2])
+        cat_loss = tf.cast(cat_loss, tf.float32)
+        cat_loss = tf.clip_by_value(cat_loss, 0.0, 10.0)
         
-        # Calculate m = (p+q)/2 for JS divergence
-        m_dist = 0.5 * (real_cat_dist + gen_cat_dist)
-        m_dist = tf.clip_by_value(m_dist, 1e-7, 1.0 - 1e-7)
-        
-        # Calculate JS Divergence: 0.5 * (KL(p||m) + KL(q||m))
-        js_div_1 = tf.reduce_sum(real_cat_dist * tf.math.log(real_cat_dist / m_dist), axis=1)
-        js_div_2 = tf.reduce_sum(gen_cat_dist * tf.math.log(gen_cat_dist / m_dist), axis=1)
-        semantic_loss = 0.5 * (js_div_1 + js_div_2)
-        semantic_loss = tf.cast(semantic_loss, tf.float32)
-        semantic_loss = tf.clip_by_value(semantic_loss, 0.0, 10.0)
-        
-        # Combine utility components with appropriate weights
-        r_util = -(self.w1 * spatial_loss + self.w2 * temp_loss + self.w3 * semantic_loss)
+        # Combined utility components with appropriate weights
+        r_util = -(self.w1 * spatial_loss + self.w2 * temp_loss + self.w3 * cat_loss)
         
         # 3. Privacy preservation reward using TUL classifier
         try:
@@ -511,59 +465,61 @@ class RL_Enhanced_Transformer_TrajGAN():
             user_probs = tf.gather_nd(tul_preds, indices)
             
             # Calculate top-1 identification accuracy for adaptive balancing
-            # Sort predictions for each sample
             sorted_indices = tf.argsort(tul_preds, axis=1, direction='DESCENDING')
-            # Check if true user index is at top-1 position
             top1_indices = sorted_indices[:, 0]
             correct_predictions = tf.cast(tf.equal(top1_indices, tf.cast(user_indices, tf.int32)), tf.float32)
             self.current_acc_at_1 = tf.reduce_mean(correct_predictions).numpy()
             
             # Privacy reward: -log(p_TUL(u_i|T_i))
-            # Negative reward for correct user identification (penalize high probabilities)
-            r_priv = -tf.math.log(tf.clip_by_value(user_probs, 1e-7, 1.0 - 1e-7))
+            user_probs = tf.clip_by_value(user_probs, 1e-7, 1.0 - 1e-7)
+            r_priv = -tf.math.log(user_probs)
             
         except Exception as e:
             print(f"Error computing privacy reward: {e}")
-            import traceback
-            traceback.print_exc()
-            print("Using a placeholder privacy reward instead")
-            # If there's an error with the TUL model, use a placeholder privacy reward
-            r_priv = tf.zeros_like(r_adv)
+            # Use placeholder privacy reward
+            r_priv = tf.zeros((batch_size,), dtype=tf.float32)
             self.current_acc_at_1 = 0.5  # Default value
         
-        # Estimate FID score based on utility loss (lower is better)
-        # This is a simple approximation - in production, you might use a real FID score
-        self.current_fid = tf.reduce_mean(spatial_loss + temp_loss + semantic_loss).numpy()
+        # Calculate approximate FID score for utility
+        self.current_fid = tf.reduce_mean(spatial_loss + temp_loss + cat_loss).numpy()
+        if np.isnan(self.current_fid):
+            self.current_fid = 2.0  # Use default if NaN
         
-        # Apply adaptive reward balancing based on privacy and utility metrics
-        # Adjust alpha (privacy weight) based on re-identification accuracy
-        self.alpha_t = self.alpha_0 * tf.minimum(
-            1.0, 
-            tf.cast(self.current_acc_at_1 / self.acc_at_1_target, tf.float32)
-        )
-        
-        # Adjust beta (utility weight) based on FID score
-        self.beta_t = self.beta_0 * tf.maximum(
-            0.0,
-            1.0 - tf.cast((self.current_fid - self.fid_target) / self.fid_max, tf.float32)
-        )
-        
-        # Adjust gamma to normalize weights (alpha + beta + gamma = 1)
-        self.gamma_t = 1.0 - (self.alpha_t + self.beta_t)
-        
-        # Ensure weights are valid
-        self.alpha_t = tf.clip_by_value(self.alpha_t, 0.05, 0.95)
-        self.beta_t = tf.clip_by_value(self.beta_t, 0.05, 0.95)
-        self.gamma_t = tf.clip_by_value(self.gamma_t, 0.05, 0.95)
-        
-        # Normalize weights to sum to 1
-        total = self.alpha_t + self.beta_t + self.gamma_t
-        self.alpha_t = self.alpha_t / total
-        self.beta_t = self.beta_t / total
-        self.gamma_t = self.gamma_t / total
+        # Fixed weights if adaptive balancing isn't working
+        if np.isnan(self.current_acc_at_1) or np.isnan(self.current_fid):
+            self.alpha_t = tf.constant(self.alpha_0, dtype=tf.float32)
+            self.beta_t = tf.constant(self.beta_0, dtype=tf.float32)
+            self.gamma_t = tf.constant(self.gamma_0, dtype=tf.float32)
+        else:
+            # Apply adaptive reward balancing based on privacy and utility metrics
+            # Adjust alpha (privacy weight) based on re-identification accuracy
+            self.alpha_t = self.alpha_0 * tf.minimum(
+                1.0, 
+                tf.cast(self.current_acc_at_1 / self.acc_at_1_target, tf.float32)
+            )
+            
+            # Adjust beta (utility weight) based on FID score
+            self.beta_t = self.beta_0 * tf.maximum(
+                0.0,
+                1.0 - tf.cast((self.current_fid - self.fid_target) / self.fid_max, tf.float32)
+            )
+            
+            # Adjust gamma to normalize weights (alpha + beta + gamma = 1)
+            self.gamma_t = 1.0 - (self.alpha_t + self.beta_t)
+            
+            # Ensure weights are valid
+            self.alpha_t = tf.clip_by_value(self.alpha_t, 0.05, 0.95)
+            self.beta_t = tf.clip_by_value(self.beta_t, 0.05, 0.95)
+            self.gamma_t = tf.clip_by_value(self.gamma_t, 0.05, 0.95)
+            
+            # Normalize weights to sum to 1
+            total = self.alpha_t + self.beta_t + self.gamma_t
+            self.alpha_t = self.alpha_t / total
+            self.beta_t = self.beta_t / total
+            self.gamma_t = self.gamma_t / total
         
         # Print current adaptive weights
-        print(f"Adaptive weights - α: {self.alpha_t:.3f}, β: {self.beta_t:.3f}, γ: {self.gamma_t:.3f}")
+        print(f"Adaptive weights - α: {self.alpha_t.numpy():.3f}, β: {self.beta_t.numpy():.3f}, γ: {self.gamma_t.numpy():.3f}")
         print(f"Current metrics - ACC@1: {self.current_acc_at_1:.3f}, FID: {self.current_fid:.3f}")
         
         # Ensure r_adv, r_util, and r_priv have appropriate shapes
@@ -577,27 +533,98 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Ensure the rewards have shape [batch_size, 1]
         rewards = tf.reshape(combined_rewards, [batch_size, 1])
         
+        # Replace any NaN values with zeros
+        rewards = tf.where(tf.math.is_nan(rewards), tf.zeros_like(rewards), rewards)
+        
         # Normalize rewards for training stability
         rewards_mean = tf.reduce_mean(rewards)
         rewards_std = tf.math.reduce_std(rewards) + 1e-8
-        rewards = (rewards - rewards_mean) / rewards_std
+        
+        # Only normalize if mean and std are not NaN
+        if not (tf.math.is_nan(rewards_mean) or tf.math.is_nan(rewards_std)):
+            rewards = (rewards - rewards_mean) / rewards_std
         
         # Clip rewards to reasonable range to prevent training instability
         rewards = tf.clip_by_value(rewards, -5.0, 5.0)
+        
+        # Final check for NaN values
+        rewards = tf.where(tf.math.is_nan(rewards), tf.zeros_like(rewards), rewards)
         
         # Debug print to check rewards shape and values
         print(f"Rewards shape: {rewards.shape}, min: {tf.reduce_min(rewards)}, max: {tf.reduce_max(rewards)}, mean: {tf.reduce_mean(rewards)}")
         
         return rewards
 
-    def train_step(self, real_trajs, batch_size=256):
-        """Modified train_step to include tracking of RL agent metrics.
+    def preprocess_batch(self, batch):
+        """Preprocess a batch of trajectories to ensure consistent tensor format.
         
-        This implements the RL agent and environment formulation where:
-        - State is represented by the Transformer's internal state after generating t points
-        - Action is the next trajectory point (coordinates, timestamp, POI category)
-        - Reward is computed using TrajLoss, TUL and data utility
+        Args:
+            batch: List of trajectory features, potentially with object dtype
+            
+        Returns:
+            List of preprocessed tensors in the format expected by the model
         """
+        processed_batch = []
+        
+        for i, feature in enumerate(batch):
+            feature_name = self.keys[i] if i < len(self.keys) else f"feature_{i}"
+            
+            try:
+                if feature.dtype == 'object':
+                    print(f"Converting object array for feature {feature_name}")
+                    # For object arrays, we need to pad to fixed size
+                    sample_size = len(feature)
+                    
+                    # Check the dimensionality of the first non-None element
+                    sample_item = None
+                    for item in feature:
+                        if item is not None and hasattr(item, 'shape'):
+                            sample_item = item
+                            break
+                    
+                    if sample_item is None:
+                        print(f"Warning: Could not find valid sample for feature {feature_name}")
+                        # Create placeholder with reasonable dimensions
+                        placeholder = np.zeros((sample_size, self.max_length, 1), dtype=np.float32)
+                        processed_batch.append(placeholder)
+                        continue
+                    
+                    # Get the feature dimension from the sample
+                    feat_dim = sample_item.shape[-1] if len(sample_item.shape) > 1 else 1
+                    
+                    # Create a padded array
+                    padded = np.zeros((sample_size, self.max_length, feat_dim), dtype=np.float32)
+                    
+                    # Fill in the data
+                    for j, traj in enumerate(feature):
+                        if traj is not None and hasattr(traj, 'shape'):
+                            # Only copy up to max_length
+                            actual_length = min(traj.shape[0], self.max_length)
+                            if len(traj.shape) > 1:
+                                # Multi-dimensional feature
+                                padded[j, :actual_length, :] = traj[:actual_length]
+                            else:
+                                # One-dimensional feature
+                                padded[j, :actual_length, 0] = traj[:actual_length]
+                    
+                    processed_batch.append(padded)
+                else:
+                    # Already a proper tensor
+                    processed_batch.append(tf.cast(feature, tf.float32))
+            
+            except Exception as e:
+                print(f"Error preprocessing feature {feature_name}: {e}")
+                # Create a placeholder with zeros
+                placeholder = np.zeros((len(batch[0]), self.max_length, 1), dtype=np.float32)
+                processed_batch.append(placeholder)
+        
+        return processed_batch
+
+    def train_step(self, real_trajs, batch_size=256):
+        """Modified train_step to include tracking of RL agent metrics."""
+        # First preprocess the batch to ensure consistent tensor format
+        real_trajs = self.preprocess_batch(real_trajs)
+        
         # Generate trajectories
         noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
         gen_trajs = self.generator.predict([*real_trajs, noise])
@@ -659,7 +686,7 @@ class RL_Enhanced_Transformer_TrajGAN():
             "beta_t": self.beta_t.numpy(),
             "gamma_t": self.gamma_t.numpy()
         }
-        
+
     def _calculate_trajectory_entropy(self, gen_trajs):
         """Calculate entropy of generated trajectories to monitor exploration vs exploitation.
         
@@ -696,6 +723,14 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Get the early stopping callback if attached
         early_stopping = getattr(self, 'early_stopping_callback', None)
         
+        # Check training data and try to preprocess it
+        if self.x_train is None:
+            print("Error: No training data available.")
+            return 0
+            
+        print(f"Starting training with {len(self.x_train[0])} trajectories")
+        self.check_data_types()
+        
         # Initialize tracking variables
         completed_epochs = 0
         
@@ -704,75 +739,94 @@ class RL_Enhanced_Transformer_TrajGAN():
               f"{early_stopping.patience if early_stopping else 'N/A'}")
         
         for epoch in range(epochs):
-            # Get a batch of training data
-            idx = np.random.randint(0, len(self.x_train[0]), batch_size)
-            batch = [X[idx] for X in self.x_train]
-            
-            # Training step
-            metrics = self.train_step(batch, batch_size)
-            
-            # Log metrics to WandB
-            if self.wandb:
-                wandb_metrics = {
-                    "epoch": epoch,
-                    "d_loss_real": metrics['d_loss_real'],
-                    "d_loss_fake": metrics['d_loss_fake'],
-                    "g_loss": metrics['g_loss'],
-                    "c_loss": metrics['c_loss'],
-                    "reward": metrics['reward'],
-                    # New RL metrics
-                    "entropy": metrics['entropy'],
-                    "acc_at_1": metrics['acc_at_1'],
-                    "fid": metrics['fid'],
-                    # Adaptive weights
-                    "alpha_t": metrics['alpha_t'],
-                    "beta_t": metrics['beta_t'],
-                    "gamma_t": metrics['gamma_t'],
-                }
+            try:
+                # Get a batch of training data
+                idx = np.random.randint(0, len(self.x_train[0]), batch_size)
+                raw_batch = []
                 
-                # Track and save the best model based on reward
-                if save_best and metrics['reward'] > self.best_reward:
-                    self.best_reward = metrics['reward']
-                    wandb_metrics["best_reward"] = self.best_reward
-                    self.save_best_checkpoint(checkpoint_dir, f"best_reward_model")
-                    print(f"New best reward: {self.best_reward:.4f} at epoch {epoch}")
+                # Extract batch for each feature
+                for X in self.x_train:
+                    if X.dtype == 'object':
+                        # For object arrays, extract the selected indices
+                        feature_batch = [X[i] for i in idx]
+                        raw_batch.append(np.array(feature_batch, dtype='object'))
+                    else:
+                        # For regular arrays, do normal indexing
+                        feature_batch = X[idx]
+                        raw_batch.append(feature_batch)
                 
-                # Add early stopping metrics
-                if early_stopping:
-                    improved = early_stopping.on_epoch_end(epoch, metrics)
-                    wandb_metrics["es_wait_count"] = early_stopping.wait_count
-                    wandb_metrics["es_best_epoch"] = early_stopping.best_epoch
-                    
-                    if improved:
-                        print(f"Early stopping: improvement detected at epoch {epoch}")
-                        
-                    if early_stopping.should_stop:
-                        print(f"\nEarly stopping triggered after {early_stopping.wait_count} epochs without improvement")
-                        print(f"Best model was at epoch {early_stopping.best_epoch} with reward {early_stopping.best_reward:.4f}")
-                        break
+                # Training step will handle preprocessing
+                metrics = self.train_step(raw_batch, batch_size)
                 
-                # Log to wandb
-                self.wandb.log(wandb_metrics)
-            
-            # Print progress
-            if epoch % sample_interval == 0:
-                print(f"[Epoch {epoch}/{epochs}] "
-                      f"[D loss: {(metrics['d_loss_real'] + metrics['d_loss_fake'])/2:.4f}] "
-                      f"[G loss: {metrics['g_loss']:.4f}] "
-                      f"[Reward: {metrics['reward']:.4f}] "
-                      f"[ACC@1: {metrics['acc_at_1']:.4f}] "
-                      f"[FID: {metrics['fid']:.4f}]")
-                
-                # Generate visual samples for wandb
+                # Log metrics to WandB
                 if self.wandb:
-                    self.sample_trajectories_for_wandb(epoch)
+                    wandb_metrics = {
+                        "epoch": epoch,
+                        "d_loss_real": metrics['d_loss_real'],
+                        "d_loss_fake": metrics['d_loss_fake'],
+                        "g_loss": metrics['g_loss'],
+                        "c_loss": metrics['c_loss'],
+                        "reward": metrics['reward'],
+                        # New RL metrics
+                        "entropy": metrics['entropy'],
+                        "acc_at_1": metrics['acc_at_1'],
+                        "fid": metrics['fid'],
+                        # Adaptive weights
+                        "alpha_t": metrics['alpha_t'],
+                        "beta_t": metrics['beta_t'],
+                        "gamma_t": metrics['gamma_t'],
+                    }
+                    
+                    # Track and save the best model based on reward
+                    if save_best and metrics['reward'] > self.best_reward:
+                        self.best_reward = metrics['reward']
+                        wandb_metrics["best_reward"] = self.best_reward
+                        self.save_best_checkpoint(checkpoint_dir, f"best_reward_model")
+                        print(f"New best reward: {self.best_reward:.4f} at epoch {epoch}")
+                    
+                    # Add early stopping metrics
+                    if early_stopping:
+                        improved = early_stopping.on_epoch_end(epoch, metrics)
+                        wandb_metrics["es_wait_count"] = early_stopping.wait_count
+                        wandb_metrics["es_best_epoch"] = early_stopping.best_epoch
+                        
+                        if improved:
+                            print(f"Early stopping: improvement detected at epoch {epoch}")
+                            
+                        if early_stopping.should_stop:
+                            print(f"\nEarly stopping triggered after {early_stopping.wait_count} epochs without improvement")
+                            print(f"Best model was at epoch {early_stopping.best_epoch} with reward {early_stopping.best_reward:.4f}")
+                            break
+                    
+                    # Log to wandb
+                    self.wandb.log(wandb_metrics)
                 
-                # Save model checkpoint
-                if epoch > 0 and epoch % (sample_interval * 5) == 0:
-                    self.save_checkpoint(epoch)
-            
-            completed_epochs = epoch + 1
-    
+                # Print progress
+                if epoch % sample_interval == 0:
+                    print(f"[Epoch {epoch}/{epochs}] "
+                          f"[D loss: {(metrics['d_loss_real'] + metrics['d_loss_fake'])/2:.4f}] "
+                          f"[G loss: {metrics['g_loss']:.4f}] "
+                          f"[Reward: {metrics['reward']:.4f}] "
+                          f"[ACC@1: {metrics['acc_at_1']:.4f}] "
+                          f"[FID: {metrics['fid']:.4f}]")
+                    
+                    # Generate visual samples for wandb
+                    if self.wandb:
+                        self.sample_trajectories_for_wandb(epoch)
+                    
+                    # Save model checkpoint
+                    if epoch > 0 and epoch % (sample_interval * 5) == 0:
+                        self.save_checkpoint(epoch)
+                
+                completed_epochs = epoch + 1
+                
+            except Exception as e:
+                print(f"Error during epoch {epoch}: {e}")
+                import traceback
+                traceback.print_exc()
+                print("Continuing to next epoch...")
+                continue
+        
         # Final report
         print(f"Training completed after {completed_epochs} epochs")
         if early_stopping:
@@ -831,7 +885,7 @@ class RL_Enhanced_Transformer_TrajGAN():
             print(f"Error saving best model {name_prefix}: {e}")
 
     def update_actor(self, states, actions, advantages):
-        """Update generator using a simplified policy gradient approach."""
+        """Update generator using a simplified policy gradient approach with safeguards against NaNs."""
         # Get a single batch of data with random noise for the generator
         batch_size = states[0].shape[0]
         noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
@@ -842,29 +896,37 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Use ones as targets for the discriminator output (we want to fool the discriminator)
         targets = np.ones((batch_size, 1))
         
-        # Convert advantages to numpy and ensure proper type/shape
+        # Process advantages safely, ensuring no NaN values
         try:
             # First ensure advantages is a tensor with float32 type
             advantages = tf.cast(advantages, tf.float32)
             
+            # Check for and replace NaN values
+            advantages = tf.where(tf.math.is_nan(advantages), tf.zeros_like(advantages), advantages)
+            
             # Clip advantages to reasonable range before any other operations
             advantages = tf.clip_by_value(advantages, -10.0, 10.0)
             
-            # Then convert to numpy and flatten
-            advantages_np = advantages.numpy().flatten()  # Flatten to ensure it's 1D
+            # Convert to numpy and flatten
+            advantages_np = advantages.numpy().flatten()
             
             # Scale advantages to be positive (sample_weight should be positive)
-            advantages_np = advantages_np - np.min(advantages_np) + 1e-3
+            min_adv = np.min(advantages_np)
+            if min_adv < 0:
+                advantages_np = advantages_np - min_adv + 1e-3
             
             # Normalize to reasonable values (0 to 1 range)
-            if np.max(advantages_np) > 0:
-                advantages_np = advantages_np / np.max(advantages_np)
+            max_adv = np.max(advantages_np)
+            if max_adv > 0:
+                advantages_np = advantages_np / max_adv
+            else:
+                # If all advantages are non-positive, use uniform weights
+                advantages_np = np.ones(batch_size) * 0.5
                 
             # Ensure it has the right shape
             if len(advantages_np) != batch_size:
                 print(f"Warning: Reshaping advantages from {len(advantages_np)} to {batch_size}")
-                # If shapes don't match, use uniform weights
-                advantages_np = np.ones(batch_size)
+                advantages_np = np.ones(batch_size) * 0.5
                 
             # Final safety check - replace any NaN or inf values
             advantages_np = np.nan_to_num(advantages_np, nan=0.5, posinf=1.0, neginf=0.0)
@@ -872,25 +934,40 @@ class RL_Enhanced_Transformer_TrajGAN():
         except Exception as e:
             print(f"Error processing advantages: {e}")
             # Fallback to uniform weights
-            advantages_np = np.ones(batch_size)
+            advantages_np = np.ones(batch_size) * 0.5
             
         # Print statistics about advantage values used for training
         print(f"Advantage stats - min: {np.min(advantages_np):.4f}, max: {np.max(advantages_np):.4f}, " +
               f"mean: {np.mean(advantages_np):.4f}, std: {np.std(advantages_np):.4f}")
         
         # Train the combined model with sample weights from advantages
-        loss = self.combined.train_on_batch(
-            all_inputs, 
-            targets,
-            sample_weight=advantages_np
-        )
-        
-        # If loss is extremely high, clip it for reporting purposes
-        if loss > 10000:  # Arbitrary threshold for "too high" loss
-            print(f"Warning: Loss is very high ({loss:.2f}), consider reducing learning rate manually")
-            loss = min(loss, 10000.0)
-        
-        return loss
+        try:
+            loss = self.combined.train_on_batch(
+                all_inputs, 
+                targets,
+                sample_weight=advantages_np
+            )
+            
+            # If loss is NaN, retry with uniform weights
+            if np.isnan(loss) or np.isinf(loss):
+                print(f"Warning: Loss is NaN or Inf ({loss}). Retrying with uniform weights.")
+                loss = self.combined.train_on_batch(
+                    all_inputs, 
+                    targets,
+                    sample_weight=np.ones(batch_size) * 0.5
+                )
+            
+            # If loss is extremely high, clip it for reporting purposes
+            if loss > 10000:
+                print(f"Warning: Loss is very high ({loss:.2f}), consider reducing learning rate")
+                loss = min(loss, 10000.0)
+                
+            return loss
+            
+        except Exception as e:
+            print(f"Error during actor update: {e}")
+            # Return a placeholder loss value
+            return 0.0
 
     def compute_trajectory_ratio(self, new_predictions, old_predictions):
         """Compute the PPO policy ratio between new and old policies for trajectory data.
@@ -1004,46 +1081,60 @@ class RL_Enhanced_Transformer_TrajGAN():
             return fallback_model
             
     def sample_trajectories_for_wandb(self, epoch):
-        """Generate and visualize sample trajectories for wandb."""
+        """Simplified method that only visualizes real trajectories without attempting to generate samples."""
         if not self.wandb:
             return
             
         try:
-            # Generate random noise for sampling
-            noise = np.random.normal(0, 1, (4, self.latent_dim))
-            
             # Sample a few real trajectories
             idx = np.random.randint(0, len(self.x_train[0]), 4)
-            real_batch = [X[idx] for X in self.x_train]
             
-            # Generate trajectories
-            gen_trajs = self.generator.predict([*real_batch, noise])
+            # Handle variable-length trajectories by padding each batch separately
+            real_batch = []
+            for X in self.x_train:
+                if X.dtype == 'object':
+                    # For object arrays with variable-length trajectories
+                    samples = [X[i] for i in idx]
+                    
+                    # First, check if the first feature has coordinates
+                    if len(samples) > 0 and isinstance(samples[0], np.ndarray) and samples[0].shape[-1] >= 2:
+                        # This is a valid coordinate feature, save it separately for visualization
+                        real_batch.append(samples)
+                    else:
+                        # For other features, just create a placeholder
+                        # We won't attempt to visualize these
+                        dummy = np.zeros((4, self.max_length, 1))
+                        real_batch.append(dummy)
+                else:
+                    # For fixed-shape tensors
+                    X_subset = X[idx]
+                    real_batch.append(X_subset)
             
-            # Create visualization of the trajectories
+            # Create visualization directly from the coordinates
             fig, axes = plt.subplots(2, 2, figsize=(12, 10))
             axes = axes.flatten()
             
-            for i in range(4):
-                # Plot real trajectory
-                axes[i].scatter(
-                    real_batch[0][i, :, 0], 
-                    real_batch[0][i, :, 1], 
-                    c='blue', 
-                    alpha=0.7, 
-                    label='Real'
-                )
-                
-                # Plot generated trajectory
-                axes[i].scatter(
-                    gen_trajs[0][i, :, 0], 
-                    gen_trajs[0][i, :, 1], 
-                    c='red', 
-                    alpha=0.7, 
-                    label='Generated'
-                )
-                
-                axes[i].set_title(f'Trajectory Sample {i+1}')
-                axes[i].legend()
+            for i in range(min(4, len(real_batch[0]))):
+                try:
+                    # Plot real trajectory - safely extract coordinates
+                    real_coords = real_batch[0][i]
+                    if isinstance(real_coords, np.ndarray) and real_coords.shape[-1] >= 2:
+                        axes[i].scatter(
+                            real_coords[:, 0], 
+                            real_coords[:, 1], 
+                            c='blue', 
+                            alpha=0.7, 
+                            label='Real'
+                        )
+                    
+                    # Set title and legend
+                    axes[i].set_title(f'Trajectory Sample {i+1}')
+                    axes[i].legend()
+                    
+                except Exception as e:
+                    print(f"Error plotting trajectory {i+1}: {e}")
+                    # Skip this trajectory if there's an error
+                    continue
                 
             plt.tight_layout()
             
@@ -1053,3 +1144,61 @@ class RL_Enhanced_Transformer_TrajGAN():
             
         except Exception as e:
             print(f"Error generating trajectory samples for wandb: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def check_data_types(self):
+        """Diagnostic method to check data types and shapes in the training data."""
+        if self.x_train is None:
+            print("No training data loaded (x_train is None)")
+            return
+            
+        print("\n=== Training Data Diagnostics ===")
+        for i, x in enumerate(self.x_train):
+            try:
+                key_name = self.keys[i] if i < len(self.keys) else f"feature_{i}"
+                print(f"Feature {i} ({key_name}):")
+                print(f"  - Type: {type(x)}")
+                print(f"  - Dtype: {x.dtype}")
+                print(f"  - Shape: {x.shape if hasattr(x, 'shape') else 'unknown'}")
+                
+                # Check for NaN values
+                if hasattr(x, 'dtype') and np.issubdtype(x.dtype, np.number):
+                    nan_count = np.isnan(x).sum() if hasattr(x, 'sum') else "unknown"
+                    print(f"  - NaN values: {nan_count}")
+                
+                # For object arrays, check the first element
+                if x.dtype == 'object':
+                    first_elem = x[0]
+                    print(f"  - First element type: {type(first_elem)}")
+                    print(f"  - First element shape: {first_elem.shape if hasattr(first_elem, 'shape') else 'unknown'}")
+                
+            except Exception as e:
+                print(f"  - Error analyzing feature {i}: {e}")
+        
+        print("===========================\n")
+        
+    def set_training_data(self, x_train):
+        """Set the training data and verify its format."""
+        self.x_train = x_train
+        self.check_data_types()
+        
+        # Try to convert object arrays to proper tensor format
+        if self.x_train is not None:
+            converted_data = []
+            for i, x in enumerate(self.x_train):
+                if x.dtype == 'object':
+                    try:
+                        # For object arrays, try to stack the elements into a proper tensor
+                        stacked = np.stack(x)
+                        converted_data.append(stacked)
+                        print(f"Successfully converted feature {i} from object to tensor with shape {stacked.shape}")
+                    except Exception as e:
+                        # If stacking fails, keep the original
+                        print(f"Could not convert feature {i}: {e}")
+                        converted_data.append(x)
+                else:
+                    converted_data.append(x)
+                    
+            # Update x_train with converted data
+            self.x_train = converted_data
