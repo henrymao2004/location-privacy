@@ -54,4 +54,28 @@ class MARC:
         """Forward pass through the model"""
         if self.model is None:
             raise ValueError("Model weights have not been loaded. Call load_weights first.")
-        return self.model(x) 
+        return self.model(x)
+        
+    def predict(self, inputs, verbose=0):
+        """Predict method for compatibility with Keras API
+        
+        Args:
+            inputs: List containing [day_indices, hour_indices, category_indices, lat_lon]
+            verbose: Verbosity level
+            
+        Returns:
+            Model predictions
+        """
+        if self.model is None:
+            raise ValueError("Model weights have not been loaded. Call load_weights first.")
+            
+        # Preprocess inputs to ensure valid indices
+        day_indices, hour_indices, category_indices, lat_lon = inputs
+        
+        # Clip indices to valid ranges for each embedding
+        day_indices = tf.clip_by_value(day_indices, 0, 6)  # Days 0-6 (7 days)
+        hour_indices = tf.clip_by_value(hour_indices, 0, 23)  # Hours 0-23 (24 hours)
+        category_indices = tf.clip_by_value(category_indices, 0, 9)  # Categories 0-9 (10 categories)
+        
+        # Use model's predict method
+        return self.model.predict([day_indices, hour_indices, category_indices, lat_lon], verbose=verbose) 
