@@ -15,17 +15,60 @@ class WandbModelCheckpoint:
         self.best_model_name = best_model_name
         self.best_reward = float('-inf')
         self.best_pre_norm_reward = float('-inf')
+        self.best_fid = float('inf')  # Lower FID is better
         self.best_epoch = 0
         self.patience = patience
         self.wait_count = 0  # Renamed from no_improvement_count for consistency
         self.should_stop = False
         # Store recent rewards to detect overfitting trends
         self.recent_rewards = deque(maxlen=5)
+        self.recent_fids = deque(maxlen=5)  # Track recent FIDs
     
     def on_epoch_end(self, epoch, logs=None):
         if logs:
-            # Prefer pre-normalized reward when available
-            if 'pre_norm_reward' in logs and logs['pre_norm_reward'] != 0.0:
+            # Use FID as primary metric for early stopping when available
+            if 'fid' in logs and logs['fid'] != 0.0:
+                current_fid = logs['fid']
+                current_reward = logs.get('pre_norm_reward', logs.get('reward', 0.0))
+                self.recent_fids.append(current_fid)
+                self.recent_rewards.append(current_reward)
+                
+                # Check if current FID is better (lower) than best FID
+                if current_fid < self.best_fid:
+                    self.best_fid = current_fid
+                    self.best_reward = logs.get('reward', 0.0)
+                    self.best_pre_norm_reward = logs.get('pre_norm_reward', 0.0)
+                    self.best_epoch = epoch
+                    self.wait_count = 0  # Reset counter when improvement is found
+                    
+                    # Save best model
+                    self.model.save_best_checkpoint(self.checkpoint_dir, self.best_model_name)
+                    
+                    # Log to wandb
+                    wandb.log({
+                        "best_fid": self.best_fid,
+                        "best_reward": self.best_reward,
+                        "best_pre_norm_reward": self.best_pre_norm_reward,
+                        "best_model_epoch": self.best_epoch
+                    })
+                    print(f"\nNew best model saved at epoch {epoch} with FID {current_fid:.4f}")
+                else:
+                    self.wait_count += 1  # Increment counter when no improvement
+                    
+                    # Log early stopping metrics
+                    wandb.log({
+                        "epochs_without_improvement": self.wait_count
+                    })
+                    
+                    # Check if we should stop training
+                    if self.wait_count >= self.patience:
+                        self.should_stop = True
+                        print(f"\nEarly stopping triggered after {self.patience} epochs without FID improvement")
+                        print(f"Best model was at epoch {self.best_epoch} with FID {self.best_fid:.4f}")
+                        return True  # Signal to stop training
+            
+            # Fall back to rewards if FID not available
+            elif 'pre_norm_reward' in logs and logs['pre_norm_reward'] != 0.0:
                 current_reward = logs['pre_norm_reward']
                 reward_type = 'pre-normalized'
                 self.recent_rewards.append(current_reward)
@@ -153,20 +196,28 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
     early_stopping = WandbModelCheckpoint(
         model=self,
         checkpoint_dir=checkpoint_dir,
-        best_model_name="best_early_stopping_model",
+        best_model_name="best_fid_model",  # Updated name to reflect FID focus
         patience=20  # Configure as needed
     )
     
     # Add patience to wandb config
     if self.wandb:
         self.wandb.config.update({
-            "early_stopping_patience": early_stopping.patience
+            "early_stopping_patience": early_stopping.patience,
+            "early_stopping_metric": "FID"  # Specify that we're using FID
         })
     
     try:
         # Training data
         x_train = np.load('data/final_train.npy', allow_pickle=True)
         self.x_train = x_train
+        
+        # Load test data for FID calculation if available
+        try:
+            x_test = np.load('data/final_test.npy', allow_pickle=True)
+        except:
+            x_test = None
+            print("Test data not found, will use training data for FID calculations")
         
         # Padding
         X_train = [pad_sequences(f, self.max_length, padding='pre', dtype='float64') 
@@ -212,12 +263,13 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
             print("Model rebuilt successfully!")
         
         # Training loop
-        print(f"Starting training for {epochs} epochs with early stopping (patience={early_stopping.patience})...")
+        print(f"Starting training for {epochs} epochs with early stopping based on FID (patience={early_stopping.patience})...")
         
         # Stats for tracking
+        best_fid = float('inf')
         best_reward = float('-inf')
         best_epoch = 0
-        mean_reward_history = []
+        fid_history = []
         
         for epoch in range(epochs):
             # Get random batch for training
@@ -228,6 +280,10 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
                 # Training step with error handling
                 metrics = self.train_step(batch, batch_size)
                 
+                # Ensure FID is tracked in metrics
+                if 'fid' not in metrics and hasattr(self, 'current_fid'):
+                    metrics['fid'] = self.current_fid
+                
                 if epoch % sample_interval == 0:
                     print(f"Epoch {epoch}/{epochs}")
                     print(f"D_loss_real: {metrics['d_loss_real']:.4f}, D_loss_fake: {metrics['d_loss_fake']:.4f}")
@@ -235,6 +291,8 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
                     print(f"Mean reward: {metrics['reward']:.4f}")
                     if 'pre_norm_reward' in metrics:
                         print(f"Pre-norm mean reward: {metrics['pre_norm_reward']:.4f}")
+                    if 'fid' in metrics:
+                        print(f"FID score: {metrics['fid']:.4f}")
                     
                     if self.wandb:
                         # Log metrics to wandb
@@ -246,6 +304,11 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
                             "c_loss": metrics['c_loss'],
                             "reward": metrics['reward']
                         }
+                        
+                        # Add FID to wandb metrics
+                        if 'fid' in metrics:
+                            wandb_metrics["fid"] = metrics['fid']
+                            fid_history.append(metrics['fid'])
                         
                         self.wandb.log(wandb_metrics)
                     
@@ -260,21 +323,24 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
                 if epoch % 50 == 0 and epoch > 0:
                     self.save_checkpoint(epoch)
                 
-                # Save best model based on mean reward
-                mean_reward = metrics['reward']
-                mean_reward_history.append(mean_reward)
-                
-                if mean_reward > best_reward:
-                    best_reward = mean_reward
+                # Save best model based on FID
+                if 'fid' in metrics and metrics['fid'] < best_fid:
+                    best_fid = metrics['fid']
                     best_epoch = epoch
                     if save_best:
                         # Save best model
-                        self.save_checkpoint(f"best_{epoch}")
+                        self.save_checkpoint(f"best_fid_{epoch}")
+                        
+                        if self.wandb:
+                            self.wandb.log({
+                                "best_fid_manually_tracked": best_fid,
+                                "best_fid_epoch_manually_tracked": best_epoch
+                            })
                 
                 # Check for early stopping
                 if early_stopping.should_stop:
-                    print(f"\nEarly stopping triggered after {early_stopping.wait_count} epochs without improvement")
-                    print(f"Best model was at epoch {early_stopping.best_epoch} with reward {early_stopping.best_reward:.4f}")
+                    print(f"\nEarly stopping triggered after {early_stopping.wait_count} epochs without FID improvement")
+                    print(f"Best model was at epoch {early_stopping.best_epoch} with FID {early_stopping.best_fid:.4f}")
                     break
                 
                 # Additional stopping criteria: check for NaN losses
@@ -286,12 +352,14 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
                 if metrics['g_loss'] > 1000 or metrics['d_loss_real'] > 1000 or metrics['d_loss_fake'] > 1000:
                     print("High loss values detected, might indicate training instability")
                     # Reduce learning rate if high losses are detected consistently
-                    if epoch > 10 and np.mean(mean_reward_history[-10:]) < np.mean(mean_reward_history[-20:-10]):
-                        print("Reducing learning rate to stabilize training")
-                        self.actor_optimizer.learning_rate = self.actor_optimizer.learning_rate * 0.5
-                        self.critic_optimizer.learning_rate = self.critic_optimizer.learning_rate * 0.5
-                        self.discriminator_optimizer.learning_rate = self.discriminator_optimizer.learning_rate * 0.5
-                        print(f"New learning rate: {self.actor_optimizer.learning_rate.numpy()}")
+                    if epoch > 10 and len(fid_history) > 10:
+                        # Check if FID is not improving
+                        if np.mean(fid_history[-5:]) > np.mean(fid_history[-10:-5]):
+                            print("Reducing learning rate to stabilize training")
+                            self.actor_optimizer.learning_rate = self.actor_optimizer.learning_rate * 0.5
+                            self.critic_optimizer.learning_rate = self.critic_optimizer.learning_rate * 0.5
+                            self.discriminator_optimizer.learning_rate = self.discriminator_optimizer.learning_rate * 0.5
+                            print(f"New learning rate: {self.actor_optimizer.learning_rate.numpy()}")
             
             except Exception as e:
                 print(f"Error during epoch {epoch}: {e}")
@@ -303,18 +371,19 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
         # Save final model
         self.save_checkpoint("final")
         
-        # Return best epoch and reward
+        # Return best FID and corresponding epoch
         if self.wandb:
             self.wandb.log({
                 "training_complete": True,
-                "best_epoch": best_epoch,
-                "best_reward": best_reward
+                "final_best_fid": early_stopping.best_fid,
+                "final_best_fid_epoch": early_stopping.best_epoch,
+                "final_best_reward": early_stopping.best_reward
             })
         
         print(f"\nTraining completed. Best model was at epoch {early_stopping.best_epoch} "
-              f"with reward {early_stopping.best_reward:.4f}")
+              f"with FID {early_stopping.best_fid:.4f}")
         
-        return early_stopping.best_epoch, early_stopping.best_reward
+        return early_stopping.best_epoch, early_stopping.best_fid
     
     except Exception as e:
         print(f"Critical error during training: {e}")
@@ -328,7 +397,7 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
             print("Failed to save emergency checkpoint")
         
         # Return default values
-        return 0, 0.0
+        return 0, float('inf')
 
 def main():
     # Initialize wandb
@@ -359,7 +428,13 @@ def main():
             },
             "early_stopping": {
                 "patience": 20,
-                "min_delta": 0.001
+                "min_delta": 0.001,
+                "metric": "FID"
+            },
+            "fid": {
+                "target": 0.5,
+                "max_expected": 5.0,
+                "improvement_direction": "decrease"  # Lower FID is better
             }
         }
     )
@@ -441,8 +516,8 @@ def main():
     original_train = model.train
     model.train = lambda *args, **kwargs: train_with_early_stopping(model, *args, **kwargs)
     
-    # Train the model with early stopping
-    best_epoch, best_reward = model.train(
+    # Train the model with early stopping based on FID
+    best_epoch, best_fid = model.train(
         epochs=epochs, 
         batch_size=batch_size, 
         sample_interval=sample_interval, 
@@ -453,11 +528,15 @@ def main():
     # Log final results
     wandb.log({
         "final_best_epoch": best_epoch,
-        "final_best_reward": best_reward
+        "final_best_fid": best_fid,
+        "training_completion_time": wandb.run.start_time + wandb.run.elapsed_time()
     })
     
     # Save the best model path to wandb
-    wandb.save(f"{checkpoint_dir}/best_early_stopping_model*")
+    wandb.save(f"{checkpoint_dir}/best_fid_model*")
+    
+    # Also save any manually tracked best FID models
+    wandb.save(f"{checkpoint_dir}/best_fid_*")
     
     # Close wandb run when done
     wandb.finish()
