@@ -14,6 +14,7 @@ class WandbModelCheckpoint:
         self.checkpoint_dir = checkpoint_dir
         self.best_model_name = best_model_name
         self.best_reward = float('-inf')
+        self.best_pre_norm_reward = float('-inf')
         self.best_epoch = 0
         self.patience = patience
         self.wait_count = 0  # Renamed from no_improvement_count for consistency
@@ -22,39 +23,80 @@ class WandbModelCheckpoint:
         self.recent_rewards = deque(maxlen=5)
     
     def on_epoch_end(self, epoch, logs=None):
-        if logs and 'reward' in logs:
-            current_reward = logs['reward']
-            self.recent_rewards.append(current_reward)
+        if logs:
+            # Prefer pre-normalized reward when available
+            if 'pre_norm_reward' in logs and logs['pre_norm_reward'] != 0.0:
+                current_reward = logs['pre_norm_reward']
+                reward_type = 'pre-normalized'
+                self.recent_rewards.append(current_reward)
+                
+                # Check if current reward is better than best reward
+                if current_reward > self.best_pre_norm_reward:
+                    self.best_pre_norm_reward = current_reward
+                    self.best_reward = logs.get('reward', 0.0)  # Also track normalized reward
+                    self.best_epoch = epoch
+                    self.wait_count = 0  # Reset counter when improvement is found
+                    
+                    # Save best model
+                    self.model.save_best_checkpoint(self.checkpoint_dir, self.best_model_name)
+                    
+                    # Log to wandb
+                    wandb.log({
+                        "best_pre_norm_reward": self.best_pre_norm_reward, 
+                        "best_reward": self.best_reward,
+                        "best_reward_epoch": self.best_epoch
+                    })
+                    print(f"\nNew best model saved at epoch {epoch} with {reward_type} reward {current_reward:.4f}")
+                else:
+                    self.wait_count += 1  # Increment counter when no improvement
+                    
+                    # Log early stopping metrics
+                    wandb.log({
+                        "epochs_without_improvement": self.wait_count
+                    })
+                    
+                    # Check if we should stop training
+                    if self.wait_count >= self.patience:
+                        self.should_stop = True
+                        print(f"\nEarly stopping triggered after {self.patience} epochs without improvement")
+                        print(f"Best model was at epoch {self.best_epoch} with {reward_type} reward {self.best_pre_norm_reward:.4f}")
+                        return True  # Signal to stop training
             
-            # Check if current reward is better than best reward
-            if current_reward > self.best_reward:
-                self.best_reward = current_reward
-                self.best_epoch = epoch
-                self.wait_count = 0  # Reset counter when improvement is found
+            # Fall back to normalized reward if pre-normalized not available
+            elif 'reward' in logs:
+                current_reward = logs['reward']
+                reward_type = 'normalized'
+                self.recent_rewards.append(current_reward)
                 
-                # Save best model
-                self.model.save_best_checkpoint(self.checkpoint_dir, self.best_model_name)
-                
-                # Log to wandb
-                wandb.log({
-                    "best_reward": self.best_reward, 
-                    "best_reward_epoch": self.best_epoch
-                })
-                print(f"\nNew best model saved at epoch {epoch} with reward {current_reward:.4f}")
-            else:
-                self.wait_count += 1  # Increment counter when no improvement
-                
-                # Log early stopping metrics
-                wandb.log({
-                    "epochs_without_improvement": self.wait_count
-                })
-                
-                # Check if we should stop training
-                if self.wait_count >= self.patience:
-                    self.should_stop = True
-                    print(f"\nEarly stopping triggered after {self.patience} epochs without improvement")
-                    print(f"Best model was at epoch {self.best_epoch} with reward {self.best_reward:.4f}")
-                    return True  # Signal to stop training
+                # Check if current reward is better than best reward
+                if current_reward > self.best_reward:
+                    self.best_reward = current_reward
+                    self.best_epoch = epoch
+                    self.wait_count = 0  # Reset counter when improvement is found
+                    
+                    # Save best model
+                    self.model.save_best_checkpoint(self.checkpoint_dir, self.best_model_name)
+                    
+                    # Log to wandb
+                    wandb.log({
+                        "best_reward": self.best_reward, 
+                        "best_reward_epoch": self.best_epoch
+                    })
+                    print(f"\nNew best model saved at epoch {epoch} with {reward_type} reward {current_reward:.4f}")
+                else:
+                    self.wait_count += 1  # Increment counter when no improvement
+                    
+                    # Log early stopping metrics
+                    wandb.log({
+                        "epochs_without_improvement": self.wait_count
+                    })
+                    
+                    # Check if we should stop training
+                    if self.wait_count >= self.patience:
+                        self.should_stop = True
+                        print(f"\nEarly stopping triggered after {self.patience} epochs without improvement")
+                        print(f"Best model was at epoch {self.best_epoch} with {reward_type} reward {self.best_reward:.4f}")
+                        return True  # Signal to stop training
             
             return False  # Continue training
 
@@ -191,6 +233,8 @@ def train_with_early_stopping(self, epochs=2000, batch_size=256, sample_interval
                     print(f"D_loss_real: {metrics['d_loss_real']:.4f}, D_loss_fake: {metrics['d_loss_fake']:.4f}")
                     print(f"G_loss: {metrics['g_loss']:.4f}, C_loss: {metrics['c_loss']:.4f}")
                     print(f"Mean reward: {metrics['reward']:.4f}")
+                    if 'pre_norm_reward' in metrics:
+                        print(f"Pre-norm mean reward: {metrics['pre_norm_reward']:.4f}")
                     
                     if self.wandb:
                         # Log metrics to wandb

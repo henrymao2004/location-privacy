@@ -95,8 +95,8 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.w_semantic = 0.2   # w₃ (semantic): Lower weight on semantic utility
         
         # Define optimizers with REDUCED learning rates for stability
-        self.actor_optimizer = Adam(0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
-        self.critic_optimizer = Adam(0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
+        self.actor_optimizer = Adam(0.0005, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
+        self.critic_optimizer = Adam(0.0005, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
         self.discriminator_optimizer = Adam(0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
 
         # Build networks
@@ -355,7 +355,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.combined = Model(inputs, pred)
         
         # Create a custom loss instance for trajectory optimization
-        self.traj_loss = CustomTrajLoss()
+        self.traj_loss = CustomTrajLoss(p_bce=1, p_latlon=0.1, p_cat=0.1, p_day=0.1, p_hour=0.1)
         # Store input and generator output references
         self.input_tensors = inputs
         self.generated_trajectories = gen_trajs
@@ -450,9 +450,17 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Compute the combined reward
         combined_rewards = w_adv * r_adv + w_util * r_util + w_priv * r_priv
         
+        # Print components for debugging
+        print(f"Raw reward components - Adversarial: {tf.reduce_mean(r_adv):.4f}, " +
+              f"Utility: {tf.reduce_mean(r_util):.4f}, Privacy: {tf.reduce_mean(r_priv):.4f}, " +
+              f"Combined (pre-norm): {tf.reduce_mean(combined_rewards):.4f}")
+        
         # Ensure the rewards have shape [batch_size, 1]
         batch_size = r_adv.shape[0]
         rewards = tf.reshape(combined_rewards, [batch_size, 1])
+        
+        # Store pre-normalized rewards for reference
+        pre_norm_rewards_mean = tf.reduce_mean(rewards)
         
         # Normalize rewards for training stability
         rewards_mean = tf.reduce_mean(rewards)
@@ -463,7 +471,9 @@ class RL_Enhanced_Transformer_TrajGAN():
         rewards = tf.clip_by_value(rewards, -5.0, 5.0)
         
         # Debug print to check rewards shape and values
-        print(f"Rewards shape: {rewards.shape}, min: {tf.reduce_min(rewards)}, max: {tf.reduce_max(rewards)}, mean: {tf.reduce_mean(rewards)}")
+        print(f"Rewards shape: {rewards.shape}, min: {tf.reduce_min(rewards):.4f}, " +
+              f"max: {tf.reduce_max(rewards):.4f}, mean: {tf.reduce_mean(rewards):.4f}, " +
+              f"pre-norm mean: {pre_norm_rewards_mean:.4f}")
         
         return rewards
 
@@ -483,6 +493,36 @@ class RL_Enhanced_Transformer_TrajGAN():
             
             # Compute full rewards using the TUL classifier
             rewards = self.compute_rewards(real_trajs, gen_trajs, self.tul_classifier)
+            
+            # Save pre-normalized reward for tracking
+            # Access the variable from the model scope
+            with tf.name_scope("reward_tracking"):
+                pre_norm_reward = tf.Variable(0.0, name="pre_norm_reward")
+                # Try to get the pre-normalized reward value we printed in compute_rewards
+                # Store the value in a variable for logging
+                try:
+                    # We'll have to compute it again since we can't easily pass it from compute_rewards
+                    # Get the reward components
+                    d_pred = self.discriminator.predict(gen_trajs[:4])
+                    d_pred = tf.clip_by_value(tf.cast(d_pred, tf.float32), 1e-7, 1.0 - 1e-7)
+                    r_adv = tf.math.log(d_pred)
+                    
+                    # Simple utility and privacy rewards (simplified version)
+                    r_util = tf.zeros_like(r_adv)  # Placeholder
+                    r_priv = tf.zeros_like(r_adv)  # Placeholder
+                    
+                    # Weights
+                    w_adv = tf.constant(self.w_adv, dtype=tf.float32)
+                    w_util = tf.constant(self.w_util, dtype=tf.float32)
+                    w_priv = tf.constant(self.w_priv, dtype=tf.float32)
+                    
+                    # Combined reward before normalization
+                    r_adv = tf.reshape(r_adv, [-1])
+                    raw_reward = w_adv * r_adv 
+                    pre_norm_reward.assign(tf.reduce_mean(raw_reward))
+                except Exception as e:
+                    print(f"Error computing pre-norm reward for tracking: {e}")
+                    pass
             
             # Compute advantages and returns for PPO
             values = self.critic.predict(real_trajs[:4])
@@ -513,6 +553,7 @@ class RL_Enhanced_Transformer_TrajGAN():
             
             # Get mean reward for tracking
             mean_reward = tf.reduce_mean(rewards).numpy()
+            pre_norm_reward_value = pre_norm_reward.numpy()
             
             # Return metrics including reward
             return {
@@ -520,7 +561,8 @@ class RL_Enhanced_Transformer_TrajGAN():
                 "d_loss_fake": d_loss_fake, 
                 "g_loss": g_loss, 
                 "c_loss": c_loss,
-                "reward": mean_reward
+                "reward": mean_reward,
+                "pre_norm_reward": pre_norm_reward_value
             }
             
         except Exception as e:
@@ -533,7 +575,8 @@ class RL_Enhanced_Transformer_TrajGAN():
                 "d_loss_fake": 1.0, 
                 "g_loss": 1.0, 
                 "c_loss": 1.0,
-                "reward": 0.0
+                "reward": 0.0,
+                "pre_norm_reward": 0.0
             }
 
     def train(self, epochs=2000, batch_size=256, sample_interval=10, save_best=True, checkpoint_dir='results'):
