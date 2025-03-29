@@ -135,8 +135,8 @@ def evaluate_model(model, weights_path, X_test, traj_lengths):
         # Generate trajectories
         gen_trajs = model.generator.predict(X_test)
         
-        # Prepare inputs for discriminator
-        disc_inputs = gen_trajs[:4]  # First 4 elements are lat_lon, category, day, hour
+        # Prepare inputs for discriminator - use all inputs including mask
+        disc_inputs = gen_trajs  # Include all elements, not just the first 4
         
         # Get discriminator predictions
         d_preds = model.discriminator.predict(disc_inputs)

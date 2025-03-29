@@ -93,14 +93,16 @@ def main():
     model.tul_classifier = tul_classifier
     
     # Training parameters
-    epochs = 200
+    epochs = 2000
     batch_size = 256
     sample_interval = 10
     
     # Early stopping parameters
     early_stopping = True
-    patience = 15
+    patience = 30  # Increased patience for multi-metric approach
     min_delta = 0.001
+    
+    print(f"Starting training for {epochs} epochs with early stopping (patience={patience})...")
     
     # Train the model with early stopping and wandb integration
     model.train(

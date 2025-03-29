@@ -6,12 +6,20 @@ from tensorflow.keras import layers
 import tensorflow_probability as tfp
 import os
 import json
+import warnings
+
+# Add wandb import with try-except to handle cases where it might not be available
+try:
+    import wandb
+except ImportError:
+    warnings.warn("wandb not installed. WandB logging will be disabled.")
+    wandb = None
 
 random.seed(2020)
 np.random.seed(2020)
 tf.random.set_seed(2020)
 
-from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, MultiHeadAttention, LayerNormalization, Dropout
+from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, MultiHeadAttention, LayerNormalization, Dropout, GlobalAveragePooling1D, Reshape
 from keras.initializers import he_uniform
 from keras.regularizers import l1
 
@@ -73,32 +81,76 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         self.x_train = None
         
-        # RL parameters
+        # RL parameters - adjusting for better performance
         self.gamma = 0.99  # discount factor
         self.gae_lambda = 0.95  # GAE parameter
         self.clip_epsilon = 0.2  # PPO clip parameter
-        self.c1 = 0.5  # value function coefficient (reduced)
-        self.c2 = 0.01  # entropy coefficient
-        self.ppo_epochs = 4  # Number of PPO epochs per batch
+        self.c1 = 0.4  # value function coefficient (reduced from 0.5)
+        self.c2 = 0.005  # entropy coefficient (reduced from 0.01)
+        self.ppo_epochs = 3  # Number of PPO epochs per batch (reduced from 4)
+        
+        # Generator-Discriminator balance parameter - increase gen updates for better learning
+        self.gen_updates_per_disc = 4  # Update generator this many times per discriminator update (increased from 3)
+        
+        # Dynamic clip limits - updated based on baseline analysis
+        self.initial_clip_limits = {
+            'spatial': 5.0,    # Reduce from 10.0 to focus on better spatial learning
+            'temporal': 6.0,   # Reduce from 12.0
+            'category': 5.0    # Reduce from 12.0
+        }
+        self.max_clip_limits = {
+            'spatial': 8.0,     # Keep lower than before
+            'temporal': 15.0,   # Reduce from 35.0
+            'category': 12.0    # Reduce from 25.0
+        }
+        self.clip_increase_start_epoch = 30  # Start increasing clips earlier (was 50)
+        self.clip_increase_frequency = 10    # Increase clip limits more frequently (was 15)
+        self.clip_increase_rate = 0.15       # Slower increase rate (was 0.25)
+        self.current_clip_limits = self.initial_clip_limits.copy()
+        self.current_epoch = 0  # Track current epoch for clip limit adjustment
         
         # Load or initialize TUL classifier for privacy rewards
         self.tul_classifier = self.load_tul_classifier()
         
-        # Updated reward weights for less privacy
-        self.w_adv = 0.6    # Increased adversarial weight
-        self.w_util = 0.8   # Significantly increased utility weight
-        self.w_priv = 0.2   # Significantly reduced privacy weight
+        # Balanced reward weights - adjusted based on baseline analysis
+        self.w_adv = 0.4    # Further reduce adversarial weight
+        self.w_util = 1.0   # Increase utility weight
+        self.w_priv = 0.3   # Keep privacy weight
             
-        # Updated utility component weights
-        self.beta = 0.7     # Increased spatial loss weight
-        self.gamma = 0.4    # Increased temporal loss weight
-        self.chi = 0.4      # Increased category loss weight
-        self.alpha = 0.2
+        # Initial utility component weights - match baseline performance
+        self.initial_component_weights = {
+            'spatial': 0.8,     # Higher emphasis on spatial (was 0.6)
+            'temporal': 0.5,    # Higher initial weight for temporal (was 0.3)
+            'category': 0.4     # Higher initial weight for category (was 0.3)
+        }
         
-        # Define optimizers with reduced learning rates and gradient clipping
-        self.actor_optimizer = Adam(0.001, clipnorm=1.0)  # Reduced from 0.00005
-        self.critic_optimizer = Adam(0.001, clipnorm=1.0)  # Reduced from 0.00005
-        self.discriminator_optimizer = Adam(0.001, clipnorm=1.0)  # Reduced from 0.00001
+        # Target utility component weights - more balanced for better utility metrics
+        self.target_component_weights = {
+            'spatial': 0.7,     # Maintain strong spatial emphasis (was 0.5)
+            'temporal': 0.6,    # Higher temporal weight (was 0.5)
+            'category': 0.6     # Higher category weight (was 0.5)
+        }
+        
+        # Curriculum learning parameters - faster convergence
+        self.curriculum_start_epoch = 30      # Delay curriculum start
+        self.curriculum_duration = 200        # Longer transition period
+        
+        # Current utility component weights (will be updated during training)
+        self.current_component_weights = self.initial_component_weights.copy()
+        
+        # For backwards compatibility with existing code
+        self.beta = self.initial_component_weights['spatial']
+        self.gamma_temporal = self.initial_component_weights['temporal']
+        self.chi = self.initial_component_weights['category']
+        self.alpha = 0.2    # Privacy weight
+        
+        # Tracking variable for wandb usage
+        self.use_wandb = False
+        
+        # Define optimizers with adjusted learning rates based on baseline performance
+        self.actor_optimizer = Adam(0.0005, clipnorm=0.8)  # Increased from 0.0003
+        self.critic_optimizer = Adam(0.0005, clipnorm=0.8)  # Increased from 0.0003
+        self.discriminator_optimizer = Adam(0.0001, clipnorm=0.5)  # Increased from 0.00005
 
         # Build networks
         self.generator = self.build_generator()
@@ -111,6 +163,17 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         # Combined model for training
         self.setup_combined_model()
+
+        # Track reward normalization factors for utility components
+        self.utility_norm_stats = {
+            'spatial_mean': 0.0,
+            'spatial_std': 1.0,
+            'temporal_mean': 0.0,
+            'temporal_std': 1.0,
+            'category_mean': 0.0,
+            'category_std': 1.0,
+            'update_count': 0
+        }
 
     def get_config(self):
         """Return the configuration of the model for serialization."""
@@ -182,140 +245,196 @@ class RL_Enhanced_Transformer_TrajGAN():
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=128, activation='relu', use_bias=True,  # Increased to 128 (was 100)
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_latlon = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
+                stacked_latlon = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
+                embeddings.append(stacked_latlon)
+                inputs.append(i)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=64, activation='relu', use_bias=True,  # Increased to 64 (was less)
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_attr = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
-            inputs.append(i)
-            embeddings.append(e)
+                dense_cat = [d(x) for x in unstacked]
+                stacked_cat = Lambda(lambda x: tf.stack(x, axis=1))(dense_cat)
+                embeddings.append(stacked_cat)
+                inputs.append(i)
         
-        # Add noise input to the inputs list
-        inputs.append(noise)
+        # Combine all embeddings
+        combined = Concatenate(axis=2)(embeddings)
         
-        # Add noise embedding
-        noise_repeated = Lambda(lambda x: tf.tile(tf.expand_dims(x, 1), [1, self.max_length, 1]))(noise)
-        embeddings.append(noise_repeated)
+        # Dense layer for noise input
+        noise_dense = Dense(self.max_length * 32, activation='relu')(noise)  # Increased to 32 (was smaller)
+        noise_reshape = Reshape((self.max_length, 32))(noise_dense)  # Adjust shape to match
         
-        # Feature Fusion Layer
-        concat_input = Concatenate(axis=2)(embeddings)
+        # Add noise to embeddings
+        with_noise = Concatenate(axis=2)([combined, noise_reshape])
         
-        # Project concatenated embeddings to correct dimension
-        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
+        # Apply Transformer blocks - deeper network
+        x = with_noise
         
-        # Transformer blocks
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
+        # Stack of transformer blocks with increased capacity
+        num_transformer_blocks = 3  # Reduced from 5
+        embed_dim = x.shape[-1]
         
-        # Output layers
+        for i in range(num_transformer_blocks):
+            x = TransformerBlock(
+                embed_dim=embed_dim, 
+                num_heads=8,  # Increased from fewer heads
+                ff_dim=embed_dim * 4,  # Increased multiplier 
+                rate=0.1 if i < num_transformer_blocks - 1 else 0.05  # Less dropout in final layer
+            )(x, training=True)
+        
+        # Output layers for each feature
         outputs = []
-        for idx, key in enumerate(self.keys):
-            if key == 'mask':
-                output_mask = Lambda(lambda x: x)(mask)
-                outputs.append(output_mask)
-            elif key == 'lat_lon':
-                output = TimeDistributed(Dense(2, activation='tanh'), name='output_latlon')(x)
-                scale_factor = self.scale_factor
-                output_stratched = Lambda(lambda x: x * scale_factor)(output)
-                outputs.append(output_stratched)
-            else:
-                output = TimeDistributed(Dense(self.vocab_size[key], activation='softmax'), 
-                                       name='output_' + key)(x)
-                outputs.append(output)
         
-        return Model(inputs=inputs, outputs=outputs)
+        # Lat-lon output - improved precision
+        lat_lon_out = TimeDistributed(Dense(self.vocab_size['lat_lon'], activation='tanh'))(x)  # tanh for bounded outputs
+        outputs.append(lat_lon_out)
+        
+        # Day output
+        day_out = TimeDistributed(Dense(self.vocab_size['day'], activation='softmax'))(x)
+        outputs.append(day_out)
+        
+        # Hour output
+        hour_out = TimeDistributed(Dense(self.vocab_size['hour'], activation='softmax'))(x)
+        outputs.append(hour_out)
+        
+        # Category output
+        cat_out = TimeDistributed(Dense(self.vocab_size['category'], activation='softmax'))(x)
+        outputs.append(cat_out)
+        
+        # Mask output (pass-through)
+        outputs.append(mask)
+        
+        # Create the model
+        model = Model(inputs + [noise], outputs, name='generator')
+        return model
 
     def build_critic(self):
-        # Input Layer
+        # Input Layer - similar to generator
         inputs = []
         embeddings = []
         
+        # Prepare inputs for each feature
         for idx, key in enumerate(self.keys):
             if key == 'mask':
+                mask = Input(shape=(self.max_length, 1), name='input_mask')
+                inputs.append(mask)
                 continue
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=128, activation='relu', use_bias=True,  # Increased to 128 (was 100)
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_latlon = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
+                stacked_latlon = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
+                embeddings.append(stacked_latlon)
+                inputs.append(i)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=64, activation='relu', use_bias=True,  # Increased to 64 (was less)
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_attr = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
-            inputs.append(i)
-            embeddings.append(e)
+                dense_cat = [d(x) for x in unstacked]
+                stacked_cat = Lambda(lambda x: tf.stack(x, axis=1))(dense_cat)
+                embeddings.append(stacked_cat)
+                inputs.append(i)
         
-        # Feature Fusion Layer
-        concat_input = Concatenate(axis=2)(embeddings)
+        # Combine all embeddings
+        combined = Concatenate(axis=2)(embeddings)
         
-        # Project concatenated embeddings to correct dimension
-        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
+        # Apply transformer blocks - similar to generator
+        x = combined
+        embed_dim = x.shape[-1]
         
-        # Transformer blocks
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
+        # Stack of transformer blocks with residual connections
+        num_transformer_blocks = 4  # Slightly fewer than generator
         
-        # Global average pooling
-        x = tf.keras.layers.GlobalAveragePooling1D()(x)
+        for i in range(num_transformer_blocks):
+            x = TransformerBlock(
+                embed_dim=embed_dim, 
+                num_heads=6,  # 6 heads 
+                ff_dim=embed_dim * 3,  # 3x multiplier
+                rate=0.1
+            )(x, training=True)
         
-        # Value head
+        # Global average pooling to get sequence-level representation
+        x = GlobalAveragePooling1D()(x)
+        
+        # Value output - deeper network
+        x = Dense(256, activation='relu')(x)  # Increased from smaller size
+        x = Dropout(0.2)(x)  # Added dropout for regularization
+        x = Dense(128, activation='relu')(x)  # Additional layer
+        x = Dropout(0.1)(x)  # Added dropout
         value = Dense(1)(x)
         
-        return Model(inputs=inputs, outputs=value)
+        # Create model
+        model = Model(inputs, value, name='critic')
+        return model
 
     def build_discriminator(self):
-        # Similar to original discriminator but with Transformer blocks
+        # Create inputs for each feature - similar to generator and critic
         inputs = []
         embeddings = []
         
+        # Prepare inputs for each feature
         for idx, key in enumerate(self.keys):
             if key == 'mask':
+                mask = Input(shape=(self.max_length, 1), name='input_mask')
+                inputs.append(mask)
                 continue
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=128, activation='relu', use_bias=True,  # Increased to 128 (was 100) 
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_latlon = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
+                stacked_latlon = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
+                embeddings.append(stacked_latlon)
+                inputs.append(i)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=64, activation='relu', use_bias=True,  # Increased to 64 (was less)
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_attr = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
-            inputs.append(i)
-            embeddings.append(e)
+                dense_cat = [d(x) for x in unstacked]
+                stacked_cat = Lambda(lambda x: tf.stack(x, axis=1))(dense_cat)
+                embeddings.append(stacked_cat)
+                inputs.append(i)
         
-        # Feature Fusion Layer
-        concat_input = Concatenate(axis=2)(embeddings)
+        # Combine all embeddings
+        combined = Concatenate(axis=2)(embeddings)
         
-        # Project concatenated embeddings to correct dimension
-        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
+        # Apply transformer blocks
+        x = combined
+        embed_dim = x.shape[-1]
         
-        # Transformer blocks
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
+        # Stack of transformer blocks - deeper network for discriminator
+        num_transformer_blocks = 6  # More layers for discriminator
         
-        # Global average pooling
-        x = tf.keras.layers.GlobalAveragePooling1D()(x)
+        for i in range(num_transformer_blocks):
+            x = TransformerBlock(
+                embed_dim=embed_dim, 
+                num_heads=8,  # More attention heads
+                ff_dim=embed_dim * 4,  # Larger feed-forward network
+                rate=0.15  # Slightly more dropout
+            )(x, training=True)
         
-        # Output
-        sigmoid = Dense(1, activation='sigmoid')(x)
+        # Global average pooling to get sequence-level representation
+        x = GlobalAveragePooling1D()(x)
         
-        return Model(inputs=inputs, outputs=sigmoid)
+        # Multi-layer classification network
+        x = Dense(256, activation='relu', kernel_regularizer=l1(0.0001))(x)  # Added L1 regularization
+        x = Dropout(0.3)(x)  # More dropout
+        x = Dense(128, activation='relu', kernel_regularizer=l1(0.0001))(x)
+        x = Dropout(0.2)(x)
+        validity = Dense(1, activation='sigmoid')(x)
+        
+        # Create model
+        model = Model(inputs, validity, name='discriminator')
+        return model
 
     def setup_combined_model(self):
         # Generator inputs
@@ -338,7 +457,8 @@ class RL_Enhanced_Transformer_TrajGAN():
         gen_trajs = self.generator(inputs)
         
         # Discriminator predictions
-        pred = self.discriminator(gen_trajs[:4])
+        # Fix: Include all 5 inputs for the discriminator, including the mask (which is at gen_trajs[4])
+        pred = self.discriminator(gen_trajs)
         
         # Create the combined model
         self.combined = Model(inputs, pred)
@@ -355,195 +475,451 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Store the generator outputs for later use in reward computation
         self.gen_trajs_symbolic = gen_trajs
 
-    def compute_rewards(self, real_trajs, gen_trajs, tul_classifier):
-        """Compute the three-part reward function as described in the paper.
+    def update_clip_limits(self, epoch):
+        """Update the clip limits for utility components based on training progress.
         
         Args:
-            real_trajs: Original real trajectories
-            gen_trajs: Generated synthetic trajectories
-            tul_classifier: Pre-trained TUL classifier for privacy evaluation
-        
-        Returns:
-            Tuple of (combined_rewards, reward_components) where reward_components is a dict
-            containing individual reward components and statistics
+            epoch: Current training epoch
         """
-        # Cast inputs to float32 for consistent typing
-        gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
-        real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
+        self.current_epoch = epoch
         
-        # Adversarial reward - measures realism based on discriminator output
-        d_pred = self.discriminator.predict(gen_trajs[:4])
-        d_pred = tf.cast(d_pred, tf.float32)
-        # Clip discriminator predictions to avoid extreme log values
-        d_pred = tf.clip_by_value(d_pred, 1e-7, 1.0 - 1e-7)
-        r_adv = tf.math.log(d_pred)
+        # Only start increasing clip limits after specified epoch
+        if epoch < self.clip_increase_start_epoch:
+            if epoch % 20 == 0:  # Log occasionally before starting
+                print(f"Epoch {epoch}: Clip limit updates will start at epoch {self.clip_increase_start_epoch}")
+            return False
         
-        # Utility preservation reward - measures statistical similarity
-        # Spatial loss - L2 distance between coordinates
-        spatial_loss = tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]), axis=[1, 2])
-        spatial_loss = tf.cast(spatial_loss, tf.float32)
-        # Clip spatial loss to avoid extremely large values
-        spatial_loss = tf.clip_by_value(spatial_loss, 0.0, 10.0)
+        # Track if limits changed in this update
+        limits_changed = False
+        reset_components = []
         
-        # Temporal loss - cross-entropy on temporal distributions (day and hour)
-        # Clip generated values to avoid log(0)
-        gen_trajs_day_clipped = tf.clip_by_value(gen_trajs[2], 1e-7, 1.0 - 1e-7)
-        temp_day_loss = -tf.reduce_sum(real_trajs[2] * tf.math.log(gen_trajs_day_clipped), axis=[1, 2])
-        temp_day_loss = tf.cast(temp_day_loss, tf.float32)
-        temp_day_loss = tf.clip_by_value(temp_day_loss, 0.0, 10.0)
+        # Check if it's time to increase clip limits
+        epochs_since_start = epoch - self.clip_increase_start_epoch
         
-        gen_trajs_hour_clipped = tf.clip_by_value(gen_trajs[3], 1e-7, 1.0 - 1e-7)
-        temp_hour_loss = -tf.reduce_sum(real_trajs[3] * tf.math.log(gen_trajs_hour_clipped), axis=[1, 2])
-        temp_hour_loss = tf.cast(temp_hour_loss, tf.float32)
-        temp_hour_loss = tf.clip_by_value(temp_hour_loss, 0.0, 10.0)
+        # Log on first eligible epoch
+        if epochs_since_start == 0:
+            print(f"Epoch {epoch}: Reached clip limit increase start epoch. Current limits - "
+                  f"Temporal: {self.current_clip_limits['temporal']:.2f}, "
+                  f"Category: {self.current_clip_limits['category']:.2f}")
         
-        # Categorical loss - cross-entropy on category distributions
-        gen_trajs_cat_clipped = tf.clip_by_value(gen_trajs[1], 1e-7, 1.0 - 1e-7)
-        cat_loss = -tf.reduce_sum(real_trajs[1] * tf.math.log(gen_trajs_cat_clipped), axis=[1, 2])
-        cat_loss = tf.cast(cat_loss, tf.float32)
-        cat_loss = tf.clip_by_value(cat_loss, 0.0, 10.0)
+        if epochs_since_start > 0 and epochs_since_start % self.clip_increase_frequency == 0:
+            print(f"Epoch {epoch}: Eligible for clip limit increase (epochs since start: {epochs_since_start}, "
+                  f"frequency: {self.clip_increase_frequency})")
+            
+            # Increase each clip limit
+            for component in ['temporal', 'category']:
+                old_limit = self.current_clip_limits[component]
+                # Increase by clip_increase_rate (e.g., 20%)
+                new_limit = self.current_clip_limits[component] * (1 + self.clip_increase_rate)
+                # Cap at max limit
+                self.current_clip_limits[component] = min(new_limit, self.max_clip_limits[component])
+                
+                # Check if limit actually changed
+                if abs(old_limit - self.current_clip_limits[component]) > 1e-6:
+                    limits_changed = True
+                    reset_components.append(component)
+                    print(f"  - {component.capitalize()} limit increased: {old_limit:.2f} -> {self.current_clip_limits[component]:.2f}")
+                else:
+                    print(f"  - {component.capitalize()} limit unchanged: {old_limit:.2f} (max: {self.max_clip_limits[component]:.2f})")
+            
+            # Reset normalization statistics for components that changed
+            if reset_components:
+                print(f"Resetting normalization statistics for components: {', '.join(reset_components)}")
+                for component in reset_components:
+                    if component == 'temporal':
+                        self.utility_norm_stats['temporal_mean'] = 0.0
+                        self.utility_norm_stats['temporal_std'] = 1.0
+                    elif component == 'category':
+                        self.utility_norm_stats['category_mean'] = 0.0
+                        self.utility_norm_stats['category_std'] = 1.0
+                
+                # Reset update counter to quickly adapt to new statistics
+                self.utility_norm_stats['update_count'] = 0
+                print("Normalization statistics reset complete")
+            
+            print(f"Epoch {epoch}: Updated clip limits - Temporal: {self.current_clip_limits['temporal']:.2f}, "
+                  f"Category: {self.current_clip_limits['category']:.2f}")
+        elif epoch % 10 == 0:
+            # Log status every 10 epochs for monitoring
+            print(f"Epoch {epoch}: Current clip limits - Temporal: {self.current_clip_limits['temporal']:.2f}, "
+                  f"Category: {self.current_clip_limits['category']:.2f}, Next update at epoch {self.clip_increase_start_epoch + ((epochs_since_start // self.clip_increase_frequency) + 1) * self.clip_increase_frequency}")
+            
+        return limits_changed
+    
+    def set_manual_clip_limits(self, temporal=None, category=None, spatial=None, reset_stats=True):
+        """Manually set clip limits for utility components.
         
-        # Combine utility components with appropriate weights
-        # Convert Python floats to TensorFlow constants with explicit type
-        beta = tf.constant(1.0, dtype=tf.float32)
-        gamma = tf.constant(0.5, dtype=tf.float32)  # Renamed to avoid clash with class attribute
-        chi = tf.constant(0.5, dtype=tf.float32)
+        Args:
+            temporal: New clip limit for temporal component (None = no change)
+            category: New clip limit for category component (None = no change)
+            spatial: New clip limit for spatial component (None = no change)
+            reset_stats: Whether to reset normalization statistics for changed components
+            
+        Returns:
+            Dictionary of changes made
+        """
+        changes = {}
+        reset_components = []
         
-        # Store individual utility components for tracking
-        spatial_component = -beta * spatial_loss
-        temporal_component = -gamma * (temp_day_loss + temp_hour_loss)
-        category_component = -chi * cat_loss
+        # Update temporal clip limit if provided
+        if temporal is not None:
+            old_limit = self.current_clip_limits['temporal']
+            # Ensure new limit is within bounds
+            new_limit = min(max(temporal, 1.0), self.max_clip_limits['temporal'])
+            self.current_clip_limits['temporal'] = new_limit
+            changes['temporal'] = (old_limit, new_limit)
+            print(f"Manual update: Temporal clip limit changed from {old_limit:.2f} to {new_limit:.2f}")
+            if reset_stats and abs(new_limit - old_limit) > 1e-6:
+                reset_components.append('temporal')
         
-        r_util = spatial_component + temporal_component + category_component
+        # Update category clip limit if provided
+        if category is not None:
+            old_limit = self.current_clip_limits['category']
+            # Ensure new limit is within bounds
+            new_limit = min(max(category, 1.0), self.max_clip_limits['category'])
+            self.current_clip_limits['category'] = new_limit
+            changes['category'] = (old_limit, new_limit)
+            print(f"Manual update: Category clip limit changed from {old_limit:.2f} to {new_limit:.2f}")
+            if reset_stats and abs(new_limit - old_limit) > 1e-6:
+                reset_components.append('category')
         
-        # Privacy preservation reward using TUL classifier
-        # Adapt input format for MARC model which expects different dimensions
-        try:
-            batch_size = gen_trajs[0].shape[0]
-            
-            # Format inputs for MARC model:
-            # 1. Convert one-hot to indices for day, hour, category
-            # Note: gen_trajs order is [lat_lon, category, day, hour, mask]
-            
-            # Convert one-hot day to indices (batch_size, 144) where each value is 0-6
-            day_indices = tf.cast(tf.argmax(gen_trajs[2], axis=-1), tf.int32)
-            # Clip day values to ensure they're in the valid range [0, 6]
-            day_indices = tf.clip_by_value(day_indices, 0, 6)
-            
-            # Convert one-hot hour to indices (batch_size, 144) where each value is 0-23
-            hour_indices = tf.cast(tf.argmax(gen_trajs[3], axis=-1), tf.int32)
-            # Clip hour values to ensure they're in the valid range [0, 23]
-            hour_indices = tf.clip_by_value(hour_indices, 0, 23)
-            
-            # Convert one-hot category to indices (batch_size, 144) where each value is 0-9
-            category_indices = tf.cast(tf.argmax(gen_trajs[1], axis=-1), tf.int32)
-            # Clip category values to ensure they're in valid range [0, 9]
-            category_indices = tf.clip_by_value(category_indices, 0, 9)
-            
-            # Format lat_lon to match MARC's expected input shape (batch_size, 144, 40)
-            # Since our lat_lon is (batch_size, 144, 2), we'll pad it to 40 dimensions
-            lat_lon_padded = tf.pad(gen_trajs[0], [[0, 0], [0, 0], [0, 38]])
-            
-            print(f"Input shapes - Day: {day_indices.shape}, Hour: {hour_indices.shape}, " +
-                  f"Category: {category_indices.shape}, Lat_lon: {lat_lon_padded.shape}")
-            print(f"Day range: [{tf.reduce_min(day_indices)}, {tf.reduce_max(day_indices)}]")
-            
-            # Call the MARC model with the correctly formatted inputs
-            tul_preds = tul_classifier([day_indices, hour_indices, category_indices, lat_lon_padded])
-            
-            # Extract the probability for the correct user
-            # Get the number of output classes from the TUL model
-            num_users = tul_preds.shape[1]
-            print(f"TUL predictions shape: {tul_preds.shape}")
-            
-            # Generate user indices but make sure they don't exceed the valid range
-            user_indices = np.arange(batch_size) % num_users
-            
-            # Safely gather user probabilities
-            batch_indices = tf.range(batch_size, dtype=tf.int32)
-            indices = tf.stack([batch_indices, tf.cast(user_indices, tf.int32)], axis=1)
-            user_probs = tf.gather_nd(tul_preds, indices)
-            
-            # Negative reward for correct user identification (penalize high probabilities)
-            alpha = tf.constant(1.0, dtype=tf.float32)  # Privacy weight
-            r_priv = -alpha * tf.cast(user_probs, tf.float32)
-            
-            # Calculate TUL accuracy for monitoring effectiveness
-            tul_top1_preds = tf.argmax(tul_preds, axis=1)
-            tul_accuracy = tf.reduce_mean(tf.cast(tf.equal(tul_top1_preds, tf.cast(user_indices, tf.int64)), tf.float32))
-            
-        except Exception as e:
-            print(f"Error computing privacy reward: {e}")
-            import traceback
-            traceback.print_exc()
-            print("Using a placeholder privacy reward instead")
-            # If there's an error with the TUL model, use a placeholder privacy reward
-            r_priv = tf.zeros_like(r_adv)
-            tul_accuracy = tf.constant(0.0)
+        # Update spatial clip limit if provided
+        if spatial is not None:
+            old_limit = self.current_clip_limits['spatial']
+            # Ensure new limit is within bounds
+            new_limit = min(max(spatial, 1.0), self.max_clip_limits['spatial'])
+            self.current_clip_limits['spatial'] = new_limit
+            changes['spatial'] = (old_limit, new_limit)
+            print(f"Manual update: Spatial clip limit changed from {old_limit:.2f} to {new_limit:.2f}")
+            if reset_stats and abs(new_limit - old_limit) > 1e-6:
+                reset_components.append('spatial')
         
-        # Reshape individual reward components for consistency
-        batch_size = tf.shape(r_adv)[0]
-        r_adv = tf.reshape(r_adv, [-1])
-        r_util = tf.reshape(r_util, [-1])
-        r_priv = tf.reshape(r_priv, [-1])
-        
-        # Combined reward with configurable weights
-        w1 = tf.constant(self.w_adv, dtype=tf.float32)
-        w2 = tf.constant(self.w_util, dtype=tf.float32)
-        w3 = tf.constant(self.w_priv, dtype=tf.float32)
-        
-        r_adv = tf.cast(r_adv, tf.float32)
-        
-        # Compute the combined reward
-        combined_rewards = w1 * r_adv + w2 * r_util + w3 * r_priv
-        
-        # Ensure the rewards have shape [batch_size, 1]
-        rewards = tf.reshape(combined_rewards, [batch_size, 1])
-        
-        # Normalize rewards for training stability
-        rewards_mean = tf.reduce_mean(rewards)
-        rewards_std = tf.math.reduce_std(rewards) + 1e-8
-        rewards = (rewards - rewards_mean) / rewards_std
-        
-        # Clip rewards to reasonable range to prevent training instability
-        rewards = tf.clip_by_value(rewards, -5.0, 5.0)
-        
-        # Debug print to check rewards shape and values
-        print(f"Rewards shape: {rewards.shape}, min: {tf.reduce_min(rewards)}, max: {tf.reduce_max(rewards)}, mean: {tf.reduce_mean(rewards)}")
-        
-        # Collect reward components and metrics for monitoring
-        reward_components = {
-            # Raw component values (pre-weighting)
-            'r_adv_raw': r_adv,
-            'r_util_raw': r_util,
-            'r_priv_raw': r_priv,
+        # Reset normalization statistics for changed components if requested
+        if reset_stats and reset_components:
+            print(f"Resetting normalization statistics for components: {', '.join(reset_components)}")
+            for component in reset_components:
+                if component == 'temporal':
+                    self.utility_norm_stats['temporal_mean'] = 0.0
+                    self.utility_norm_stats['temporal_std'] = 1.0
+                elif component == 'category':
+                    self.utility_norm_stats['category_mean'] = 0.0
+                    self.utility_norm_stats['category_std'] = 1.0
+                elif component == 'spatial':
+                    self.utility_norm_stats['spatial_mean'] = 0.0
+                    self.utility_norm_stats['spatial_std'] = 1.0
             
-            # Weighted component values
-            'r_adv': w1 * r_adv,
-            'r_util': w2 * r_util,
-            'r_priv': w3 * r_priv,
+            # Reset update counter to quickly adapt to new statistics
+            self.utility_norm_stats['update_count'] = 0
+            print("Normalization statistics reset complete")
+        
+        # Print summary if any changes were made
+        if changes:
+            print(f"Current clip limits after manual update - Temporal: {self.current_clip_limits['temporal']:.2f}, "
+                  f"Category: {self.current_clip_limits['category']:.2f}, Spatial: {self.current_clip_limits['spatial']:.2f}")
             
-            # Utility subcomponents
-            'spatial_loss': spatial_loss,
-            'temporal_loss': temp_day_loss + temp_hour_loss,
-            'category_loss': cat_loss,
+        return changes
+                  
+    def update_component_weights(self, epoch):
+        """Update utility component weights according to curriculum learning schedule.
+        
+        Args:
+            epoch: Current training epoch
+        """
+        self.current_epoch = epoch
+        
+        # Track if weights changed in this update
+        weights_changed = False
+        old_weights = self.current_component_weights.copy()
+        
+        # Only start curriculum after specified epoch
+        if epoch < self.curriculum_start_epoch:
+            return weights_changed
             
-            # Utility reward components
-            'spatial_component': spatial_component, 
-            'temporal_component': temporal_component,
-            'category_component': category_component,
+        # Check if we're still in curriculum phase
+        if epoch >= self.curriculum_start_epoch + self.curriculum_duration:
+            # We've reached the end of curriculum, use target weights
+            self.current_component_weights = self.target_component_weights.copy()
             
-            # TUL metrics
-            'tul_accuracy': tul_accuracy,
+            # Check if weights actually changed
+            for component in ['spatial', 'temporal', 'category']:
+                if abs(old_weights[component] - self.current_component_weights[component]) > 1e-6:
+                    weights_changed = True
+                    
+            return weights_changed
             
-            # Combined reward stats
-            'rewards_mean': rewards_mean,
-            'rewards_std': rewards_std,
-            'rewards_min': tf.reduce_min(rewards),
-            'rewards_max': tf.reduce_max(rewards)
+        # Calculate progress through curriculum (0.0 to 1.0)
+        progress = (epoch - self.curriculum_start_epoch) / self.curriculum_duration
+        
+        # Linearly interpolate between initial and target weights
+        for component in ['spatial', 'temporal', 'category']:
+            initial = self.initial_component_weights[component]
+            target = self.target_component_weights[component]
+            current = initial + progress * (target - initial)
+            self.current_component_weights[component] = current
+            
+            # Check if weight changed significantly
+            if abs(old_weights[component] - current) > 0.01:  # 1% change threshold
+                weights_changed = True
+            
+        # Update legacy attributes for backward compatibility
+        self.beta = self.current_component_weights['spatial']
+        self.gamma_temporal = self.current_component_weights['temporal']
+        self.chi = self.current_component_weights['category']
+        
+        # Log changes at regular intervals
+        if epoch % 10 == 0 or (epoch - self.curriculum_start_epoch) % 50 == 0:
+            print(f"Epoch {epoch}: Updated component weights - "
+                  f"Spatial: {self.beta:.3f}, Temporal: {self.gamma_temporal:.3f}, Category: {self.chi:.3f}")
+                  
+        return weights_changed
+    
+    def compute_rewards(self, real_trajs, gen_trajs, tul_classifier):
+        """Compute reward signals for generator actions.
+        
+        Args:
+            real_trajs: List of real trajectory tensors
+            gen_trajs: List of generated trajectory tensors
+            tul_classifier: TUL classifier model or None
+            
+        Returns:
+            rewards: Dictionary containing reward components
+        """
+        # Calculate adversarial rewards - no need to create a new list, use gen_trajs directly
+        
+        # Get discriminator predictions - pass the entire gen_trajs list directly
+        d_pred = self.discriminator.predict(gen_trajs, verbose=0)
+        
+        # Calculate adversarial reward (higher when discriminator is fooled)
+        adv_reward = -tf.math.log(1.0 - d_pred + 1e-8)
+        
+        # Calculate utility rewards for different components
+        utility_rewards = {
+            'spatial': self._compute_spatial_utility(real_trajs[0], gen_trajs[0], real_trajs[4]),
+            'temporal': self._compute_temporal_utility(
+                real_trajs[2], gen_trajs[2],  # day
+                real_trajs[3], gen_trajs[3],  # hour
+                real_trajs[4]  # mask
+            ),
+            'category': self._compute_category_utility(real_trajs[1], gen_trajs[1], real_trajs[4])
         }
         
-        return rewards, reward_components
+        # Apply clipping and normalization to utility rewards
+        for component, reward in utility_rewards.items():
+            # Clip rewards based on current limits
+            clip_limit = self.current_clip_limits[component]
+            
+            # Normalize rewards using running statistics if available
+            stat_key = f"{component}_mean"
+            std_key = f"{component}_std"
+            
+            if self.utility_norm_stats['update_count'] > 50:  # Increased from 10
+                # Use a blend of identity and normalized rewards during transition
+                blend_factor = min(1.0, (self.utility_norm_stats['update_count'] - 50) / 100.0)
+                raw_clipped = tf.clip_by_value(reward, -clip_limit, clip_limit)
+                normalized_reward = (reward - mean) / (std + 1e-8)
+                normalized_clipped = tf.clip_by_value(normalized_reward, -clip_limit, clip_limit)
+                utility_rewards[component] = blend_factor * normalized_clipped + (1 - blend_factor) * raw_clipped
+            else:
+                # Just apply simple clipping in early phases when stats are not reliable
+                utility_rewards[component] = tf.clip_by_value(reward, -clip_limit, clip_limit)
+                
+            # Update running statistics with an exponential moving average
+            if self.utility_norm_stats['update_count'] == 0:
+                # First update - set directly
+                self.utility_norm_stats[stat_key] = tf.reduce_mean(reward)
+                self.utility_norm_stats[std_key] = tf.math.reduce_std(reward)
+            else:
+                # Subsequent updates - use exponential moving average
+                alpha = 0.05  # Small EMA coefficient for stable updates
+                
+                # Update mean
+                current_mean = tf.reduce_mean(reward)
+                self.utility_norm_stats[stat_key] = (1 - alpha) * self.utility_norm_stats[stat_key] + alpha * current_mean
+                
+                # Update std
+                current_std = tf.math.reduce_std(reward)
+                self.utility_norm_stats[std_key] = (1 - alpha) * self.utility_norm_stats[std_key] + alpha * current_std
+        
+        # Increment update counter
+        self.utility_norm_stats['update_count'] += 1
+        
+        # Log current utility stats
+        if self.utility_norm_stats['update_count'] % 100 == 0:
+            print(f"Utility stats after {self.utility_norm_stats['update_count']} updates:")
+            for key, value in self.utility_norm_stats.items():
+                if key != 'update_count':
+                    if isinstance(value, (tf.Tensor, tf.Variable)):
+                        print(f"  {key}: {value.numpy():.4f}")
+                    else:
+                        print(f"  {key}: {value:.4f}")
+        
+        # Combine utility rewards with component weights
+        combined_utility = (
+            self.current_component_weights['spatial'] * utility_rewards['spatial'] +
+            self.current_component_weights['temporal'] * utility_rewards['temporal'] +
+            self.current_component_weights['category'] * utility_rewards['category']
+        )
+        
+        # Compute privacy reward if TUL classifier is available
+        privacy_reward = tf.zeros_like(adv_reward)
+        if tul_classifier is not None:
+            privacy_reward = self._compute_privacy_reward(gen_trajs, tul_classifier)
+            # Clip privacy reward
+            privacy_reward = tf.clip_by_value(privacy_reward, -5.0, 5.0)
+        
+        # Apply reward weights and combine all reward components
+        final_reward = (
+            self.w_adv * adv_reward +
+            self.w_util * combined_utility +
+            self.w_priv * privacy_reward
+        )
+        
+        # Final clipping for stability
+        final_reward = tf.clip_by_value(final_reward, -20.0, 20.0)
+        
+        # Return all reward components for logging and analysis
+        return {
+            'total': final_reward,
+            'adversarial': adv_reward,
+            'utility': combined_utility,
+            'spatial': utility_rewards['spatial'],
+            'temporal': utility_rewards['temporal'],
+            'category': utility_rewards['category'],
+            'privacy': privacy_reward
+        }
+
+    def _compute_spatial_utility(self, real_latlon, gen_latlon, mask):
+        """Compute spatial utility reward between real and generated lat/lon.
+        
+        Args:
+            real_latlon: Real trajectory lat/lon tensor [batch_size, max_length, 2]
+            gen_latlon: Generated trajectory lat/lon tensor [batch_size, max_length, 2]
+            mask: Mask tensor [batch_size, max_length, 1]
+            
+        Returns:
+            spatial_reward: Spatial utility reward tensor [batch_size, 1]
+        """
+        # Calculate trajectory length from mask
+        traj_length = tf.reduce_sum(mask, axis=1) + 1e-8
+        
+        # Calculate mean squared error between real and generated lat/lon
+        diff = gen_latlon - real_latlon
+        squared_diff = diff * diff
+        
+        # Apply mask to focus on valid points only
+        mask_repeated = tf.repeat(mask, 2, axis=2)
+        masked_squared_diff = squared_diff * mask_repeated
+        
+        # Sum across spatial dimensions and sequence length
+        batch_size = tf.shape(real_latlon)[0]
+        spatial_mse = tf.reduce_sum(tf.reduce_sum(
+            masked_squared_diff, axis=1), axis=1, keepdims=True) / traj_length
+        
+        # Higher reward for lower error (negative MSE)
+        # Scale reward to be proportional to error magnitude (avoid extreme values)
+        spatial_reward = -spatial_mse
+        
+        # Apply scaling based on point density - reward denser trajectories
+        point_density = traj_length / tf.cast(tf.shape(mask)[1], tf.float32)
+        density_factor = 1.0 + 0.5 * point_density  # More weight for denser trajectories
+        scaled_spatial_reward = spatial_reward * density_factor
+        
+        return scaled_spatial_reward
+
+    def _compute_temporal_utility(self, real_day, gen_day, real_hour, gen_hour, mask):
+        """Compute temporal utility reward for day and hour distributions.
+        
+        Args:
+            real_day: Real trajectory day tensor [batch_size, max_length, 7]
+            gen_day: Generated trajectory day tensor [batch_size, max_length, 7]
+            real_hour: Real trajectory hour tensor [batch_size, max_length, 24]
+            gen_hour: Generated trajectory hour tensor [batch_size, max_length, 24]
+            mask: Mask tensor [batch_size, max_length, 1]
+            
+        Returns:
+            temporal_reward: Temporal utility reward tensor [batch_size, 1]
+        """
+        # Calculate trajectory length from mask
+        traj_length = tf.reduce_sum(mask, axis=1) + 1e-8
+        
+        # Calculate cross-entropy for days (better than KL-divergence for multi-class)
+        gen_day_clipped = tf.clip_by_value(gen_day, 1e-7, 1.0)
+        day_ce = tf.keras.losses.categorical_crossentropy(real_day, gen_day_clipped)
+        
+        # Calculate cross-entropy for hours
+        gen_hour_clipped = tf.clip_by_value(gen_hour, 1e-7, 1.0)
+        hour_ce = tf.keras.losses.categorical_crossentropy(real_hour, gen_hour_clipped)
+        
+        # Apply mask to focus on valid points only
+        mask_flat = tf.squeeze(mask, axis=2)
+        day_ce_masked = day_ce * mask_flat
+        hour_ce_masked = hour_ce * mask_flat
+        
+        # Calculate average CE loss per trajectory
+        day_ce_avg = tf.reduce_sum(day_ce_masked, axis=1, keepdims=True) / traj_length
+        hour_ce_avg = tf.reduce_sum(hour_ce_masked, axis=1, keepdims=True) / traj_length
+        
+        # Weight hour consistency more than day consistency
+        temporal_loss = 0.4 * day_ce_avg + 0.6 * hour_ce_avg
+        
+        # Higher reward for lower loss (negative CE)
+        temporal_reward = -temporal_loss
+        
+        # Apply scaling based on trajectory complexity
+        # Compute day and hour diversity metrics
+        day_probs = tf.reduce_sum(real_day * mask_flat[:, :, tf.newaxis], axis=1)
+        day_probs = day_probs / (tf.reduce_sum(day_probs, axis=1, keepdims=True) + 1e-8)
+        day_entropy = -tf.reduce_sum(day_probs * tf.math.log(day_probs + 1e-8), axis=1, keepdims=True)
+        
+        hour_probs = tf.reduce_sum(real_hour * mask_flat[:, :, tf.newaxis], axis=1)
+        hour_probs = hour_probs / (tf.reduce_sum(hour_probs, axis=1, keepdims=True) + 1e-8)
+        hour_entropy = -tf.reduce_sum(hour_probs * tf.math.log(hour_probs + 1e-8), axis=1, keepdims=True)
+        
+        # Scale reward based on temporal diversity (higher reward for more diverse temporal patterns)
+        complexity_factor = 1.0 + 0.3 * (day_entropy + hour_entropy) / 2.0
+        scaled_temporal_reward = temporal_reward * complexity_factor
+        
+        return scaled_temporal_reward
+
+    def _compute_category_utility(self, real_cat, gen_cat, mask):
+        """Compute category utility reward between real and generated categories.
+        
+        Args:
+            real_cat: Real trajectory category tensor [batch_size, max_length, num_categories]
+            gen_cat: Generated trajectory category tensor [batch_size, max_length, num_categories]
+            mask: Mask tensor [batch_size, max_length, 1]
+            
+        Returns:
+            category_reward: Category utility reward tensor [batch_size, 1]
+        """
+        # Calculate trajectory length from mask
+        traj_length = tf.reduce_sum(mask, axis=1) + 1e-8
+        
+        # Calculate cross-entropy for categories
+        gen_cat_clipped = tf.clip_by_value(gen_cat, 1e-7, 1.0)
+        cat_ce = tf.keras.losses.categorical_crossentropy(real_cat, gen_cat_clipped)
+        
+        # Apply mask to focus on valid points only
+        mask_flat = tf.squeeze(mask, axis=2)
+        cat_ce_masked = cat_ce * mask_flat
+        
+        # Calculate average CE loss per trajectory
+        cat_ce_avg = tf.reduce_sum(cat_ce_masked, axis=1, keepdims=True) / traj_length
+        
+        # Higher reward for lower loss (negative CE)
+        category_reward = -cat_ce_avg
+        
+        # Apply scaling based on category diversity
+        # Compute category distribution
+        cat_probs = tf.reduce_sum(real_cat * mask_flat[:, :, tf.newaxis], axis=1)
+        cat_probs = cat_probs / (tf.reduce_sum(cat_probs, axis=1, keepdims=True) + 1e-8)
+        cat_entropy = -tf.reduce_sum(cat_probs * tf.math.log(cat_probs + 1e-8), axis=1, keepdims=True)
+        
+        # Scale reward based on category diversity
+        diversity_factor = 1.0 + 0.4 * cat_entropy  # More weight for diverse category distributions
+        scaled_category_reward = category_reward * diversity_factor
+        
+        return scaled_category_reward
 
     def train_step(self, real_trajs, batch_size=256):
         # Generate trajectories
@@ -577,23 +953,61 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         # Update discriminator
         d_loss_real = self.discriminator.train_on_batch(
-            real_trajs[:4],
+            real_trajs,  # Pass all inputs including mask
             np.ones((batch_size, 1))
         )
         d_loss_fake = self.discriminator.train_on_batch(
-            gen_trajs[:4],
+            gen_trajs,  # Pass all inputs including mask
             np.zeros((batch_size, 1))
         )
         
-        # Update generator (actor) using advantages
-        g_loss = self.update_actor(real_trajs, gen_trajs, advantages)
+        # Update generator (actor) multiple times for each discriminator update
+        g_loss_total = 0
+        for i in range(self.gen_updates_per_disc):
+            # Generate new noise for each update to increase diversity
+            noise_gen = np.random.normal(0, 1, (batch_size, self.latent_dim))
+            
+            # For the first update, use the already computed advantages
+            if i == 0:
+                g_loss = self.update_actor(real_trajs, gen_trajs, advantages)
+            else:
+                # For subsequent updates, generate new trajectories and compute new rewards/advantages
+                gen_trajs_new = self.generator.predict([*real_trajs, noise_gen])
+                gen_trajs_new = [tf.cast(tensor, tf.float32) for tensor in gen_trajs_new]
+                
+                # Compute rewards for the new trajectories
+                rewards_new, _ = self.compute_rewards(real_trajs, gen_trajs_new, self.tul_classifier)
+                
+                # Compute advantages for the new trajectories
+                values_new = self.critic.predict(real_trajs[:4])
+                values_new = tf.cast(values_new, tf.float32)
+                advantages_new = compute_advantage(rewards_new, values_new, self.gamma, self.gae_lambda)
+                
+                # Update generator with new advantages
+                g_loss = self.update_actor(real_trajs, gen_trajs_new, advantages_new)
+                
+                # Update critic with new returns if this isn't the last generator update
+                if i < self.gen_updates_per_disc - 1:
+                    returns_new = compute_returns(rewards_new, self.gamma)
+                    if returns_new.shape[0] != batch_size:
+                        returns_new = tf.reshape(returns_new, [batch_size, 1])
+                    c_loss_new = self.critic.train_on_batch(real_trajs[:4], returns_new)
+                    # Average critic losses
+                    c_loss = (c_loss + c_loss_new) / 2
+            
+            # Track total generator loss
+            g_loss_total += g_loss
+        
+        # Average the generator loss over all updates
+        g_loss = g_loss_total / self.gen_updates_per_disc
         
         # Add the reward components to the metrics
         metrics = {
             "d_loss_real": d_loss_real, 
             "d_loss_fake": d_loss_fake, 
             "g_loss": g_loss, 
-            "c_loss": c_loss
+            "c_loss": c_loss,
+            "gen_updates": self.gen_updates_per_disc  # Track number of generator updates
         }
         
         # Add reward component metrics
@@ -605,37 +1019,8 @@ class RL_Enhanced_Transformer_TrajGAN():
                 
         return metrics
 
-    def train(self, epochs=200, batch_size=256, sample_interval=10, early_stopping=False, patience=15, min_delta=0.001):
-        """Train the model with optional early stopping and wandb logging.
-        
-        Args:
-            epochs: Maximum number of training epochs
-            batch_size: Batch size for training
-            sample_interval: How often to save model checkpoints
-            early_stopping: Whether to use early stopping
-            patience: Number of epochs with no improvement after which training will stop
-            min_delta: Minimum change in loss to be considered as improvement
-        """
-        # Initialize wandb
-        import wandb
-        wandb.login()  # This will use the API key from environment variable or prompt for login
-        wandb.init(project="rl-transformer-trajgan", entity="xutao-henry-mao-vanderbilt-university",
-                   config={
-                       "epochs": epochs,
-                       "batch_size": batch_size,
-                       "latent_dim": self.latent_dim,
-                       "max_length": self.max_length,
-                       "gamma": self.gamma,
-                       "gae_lambda": self.gae_lambda,
-                       "clip_epsilon": self.clip_epsilon,
-                       "w_adv": self.w_adv,
-                       "w_util": self.w_util, 
-                       "w_priv": self.w_priv,
-                       "early_stopping": early_stopping,
-                       "patience": patience,
-                       "min_delta": min_delta
-                   })
-        
+    def prepare_training_data(self):
+        """Load and prepare training data."""
         # Training data
         x_train = np.load('data/final_train.npy', allow_pickle=True)
         self.x_train = x_train
@@ -645,7 +1030,7 @@ class RL_Enhanced_Transformer_TrajGAN():
                   for f in x_train]
         self.X_train = X_train
         
-        # Check if we need to
+        # Check if we need to rebuild the model with correct input shapes
         needs_rebuild = False
         actual_shapes = {}
         
@@ -681,22 +1066,265 @@ class RL_Enhanced_Transformer_TrajGAN():
             # Restore optimizer state if available
             if optimizer_weights is not None:
                 self.actor_optimizer.set_weights(optimizer_weights)
-            
+                
             print("Model rebuilt successfully!")
+    
+    def initialize_wandb(self):
+        """Initialize weights & biases for experiment tracking."""
+        # Skip if wandb is not available
+        if wandb is None:
+            print("WandB not available. Logging will be disabled.")
+            self.use_wandb = False
+            return
+            
+        try:
+            # Set flag for wandb usage
+            self.use_wandb = True
+            
+            # Login and initialize
+            wandb.login()  # This will use the API key from environment variable or prompt for login
+            wandb.init(project="rl-transformer-trajgan", entity="xutao-henry-mao-vanderbilt-university",
+                       config={
+                           "epochs": 2000,
+                           "batch_size": 32,
+                           "latent_dim": self.latent_dim,
+                           "max_length": self.max_length,
+                           "gamma": self.gamma,
+                           "gae_lambda": self.gae_lambda,
+                           "clip_epsilon": self.clip_epsilon,
+                           "w_adv": self.w_adv,
+                           "w_util": self.w_util, 
+                           "w_priv": self.w_priv,
+                           "gen_updates_per_disc": self.gen_updates_per_disc,
+                           "beta_initial": self.initial_component_weights['spatial'],
+                           "gamma_temporal_initial": self.initial_component_weights['temporal'],
+                           "chi_initial": self.initial_component_weights['category'],
+                           "beta_target": self.target_component_weights['spatial'],
+                           "gamma_temporal_target": self.target_component_weights['temporal'],
+                           "chi_target": self.target_component_weights['category'],
+                           "curriculum_start_epoch": self.curriculum_start_epoch,
+                           "curriculum_duration": self.curriculum_duration,
+                           "alpha": self.alpha,
+                           # Store the learning rates directly rather than trying to extract from optimizer
+                           "actor_lr": 0.0003,  # Hardcoded value from __init__
+                           "critic_lr": 0.0003,  # Hardcoded value from __init__
+                           "discriminator_lr": 0.00005,  # Hardcoded value from __init__
+                           # Dynamic clip limit parameters
+                           "initial_clip_limits": self.initial_clip_limits,
+                           "max_clip_limits": self.max_clip_limits,
+                           "clip_increase_start_epoch": self.clip_increase_start_epoch,
+                           "clip_increase_frequency": self.clip_increase_frequency,
+                           "clip_increase_rate": self.clip_increase_rate
+                       })
+
+            # Create custom wandb panels for reward analysis
+            wandb.define_metric("epoch")
+            wandb.define_metric("reward_components/*", step_metric="epoch")
+            wandb.define_metric("utility_components/*", step_metric="epoch")
+            wandb.define_metric("reward_effectiveness/*", step_metric="epoch")
+            wandb.define_metric("normalization/*", step_metric="epoch")
+            wandb.define_metric("balance/*", step_metric="epoch")
+            wandb.define_metric("clip_limits/*", step_metric="epoch")
+            wandb.define_metric("curriculum/*", step_metric="epoch")
+            wandb.define_metric("early_stopping/*", step_metric="epoch")
+            
+            print("WandB initialized successfully")
+        except Exception as e:
+            print(f"Error initializing WandB: {e}")
+            print("WandB logging will be disabled")
+            self.use_wandb = False
+
+    def train(self, epochs=2000, batch_size=32, sample_interval=10, early_stopping=True, patience=30, min_delta=0.001, start_epoch=0):
+        """Train the model.
         
-        # Early stopping variables
-        best_g_loss = float('inf')
-        no_improvement_count = 0
+        Args:
+            epochs: Number of epochs to train for
+            batch_size: Batch size for training
+            sample_interval: Interval for generating samples
+            early_stopping: Whether to use early stopping
+            patience: Patience for early stopping
+            min_delta: Minimum improvement for early stopping
+            start_epoch: Starting epoch number (for continuing training)
+        """
+        # Prepare data
+        self.prepare_training_data()
         
-        # Create custom wandb panels for reward analysis
-        wandb.define_metric("epoch")
-        wandb.define_metric("reward_components/*", step_metric="epoch")
-        wandb.define_metric("utility_components/*", step_metric="epoch")
-        wandb.define_metric("reward_effectiveness/*", step_metric="epoch")
+        # Initialize weights and biases
+        self.initialize_wandb()
+        
+        # Make sure we have properly initialized running statistics
+        if not hasattr(self, 'utility_norm_stats'):
+            self.utility_norm_stats = {
+                'spatial_mean': 0.0,
+                'spatial_std': 1.0,
+                'temporal_mean': 0.0,
+                'temporal_std': 1.0,
+                'category_mean': 0.0,
+                'category_std': 1.0,
+                'update_count': 0
+            }
+            
+        # Initialize metrics history for early stopping
+        metrics_history = {
+            'g_loss': [],
+            'd_loss': [],
+            'c_loss': [],
+            'spatial_loss_orig': [],
+            'temporal_loss_orig': [],
+            'category_loss_orig': [],
+            'tul_accuracy': []
+        }
+        
+        # Initialize best metrics for early stopping
+        best_metrics = {
+            'g_loss': float('inf'),
+            'balanced_score': 0.0,
+            'utility_improvement': 0.0,
+            'privacy_score': 0.0
+        }
+        
+        # Initialize best epochs
+        best_epochs = {
+            'g_loss': -1,
+            'balanced_score': -1,
+            'utility_improvement': -1,
+            'privacy_score': -1
+        }
+        
+        # Initialize no improvement counters
+        no_improvement_counts = {
+            'g_loss': 0,
+            'balanced_score': 0,
+            'utility_improvement': 0,
+            'privacy_score': 0
+        }
+        
+        # Early stopping window size
+        history_window = 20
+        
+        # Minimum epochs before allowing early stopping
+        # This ensures we don't stop before curriculum learning and clip limit adjustments take effect
+        min_epochs_before_stopping = max(
+            self.curriculum_start_epoch + self.curriculum_duration,
+            self.clip_increase_start_epoch + 2 * self.clip_increase_frequency
+        ) + 20  # Add margin for adjustments to stabilize
+        
+        # Add method to analyze clip limit impact
+        def analyze_clip_limit_impact(epoch):
+            """Analyze and log the impact of clip limits on training."""
+            if 'temporal_loss_orig' in metrics and 'category_loss_orig' in metrics:
+                temporal_pct = metrics['temporal_loss_orig'] / self.current_clip_limits['temporal'] * 100
+                category_pct = metrics['category_loss_orig'] / self.current_clip_limits['category'] * 100
+                
+                temporal_clipped = temporal_pct >= 99.0
+                category_clipped = category_pct >= 99.0
+                
+                if temporal_clipped or category_clipped:
+                    components_clipped = []
+                    if temporal_clipped:
+                        components_clipped.append(f"Temporal ({temporal_pct:.1f}%)")
+                    if category_clipped:
+                        components_clipped.append(f"Category ({category_pct:.1f}%)")
+                    
+                    print(f"\nEpoch {epoch}: WARNING - Components hitting clip limits: {', '.join(components_clipped)}")
+                    print(f"  - This may indicate gradient saturation and limited learning for these components")
+                    
+                    if epoch >= self.clip_increase_start_epoch:
+                        next_update = self.clip_increase_start_epoch + ((epochs_since_start // self.clip_increase_frequency) + 1) * self.clip_increase_frequency
+                        print(f"  - Next clip limit increase scheduled for epoch {next_update}")
+                        if next_update - epoch > 10:
+                            print(f"  - Consider manually adjusting clip limits or decreasing update frequency")
+                else:
+                    # All components have headroom
+                    print(f"\nEpoch {epoch}: Utility components within limits - "
+                          f"Temporal: {temporal_pct:.1f}%, Category: {category_pct:.1f}%")
+        
+        # Track epochs since last clip limit analysis
+        last_clip_analysis = -1
+        analysis_frequency = 10  # Check every 10 epochs
+        
+        X_train = self.X_train
         
         # Training loop
-        print(f"Starting training for {epochs} epochs...")
-        for epoch in range(epochs):
+        print(f"Starting training for {epochs} epochs from epoch {start_epoch}")
+        for epoch in range(start_epoch, start_epoch + epochs):
+            # Update clip limits based on current epoch
+            clip_limits_changed = self.update_clip_limits(epoch)
+            
+            # Update component weights based on curriculum
+            weights_changed = self.update_component_weights(epoch)
+            
+            # Special checks at critical points to ensure components aren't clip-limited
+            if epoch in [75, 125, 175, 225]:
+                # Check if we need to manually adjust limits
+                if hasattr(self, 'last_epoch_metrics') and 'temporal_loss_orig' in self.last_epoch_metrics:
+                    temporal_pct = self.last_epoch_metrics['temporal_loss_orig'] / self.current_clip_limits['temporal']
+                    category_pct = self.last_epoch_metrics['category_loss_orig'] / self.current_clip_limits['category']
+                    
+                    changes_made = False
+                    new_limits = {}
+                    
+                    # If temporal component is hitting >90% of clip limit, increase it
+                    if temporal_pct > 0.9:
+                        old_limit = self.current_clip_limits['temporal']
+                        new_limit = min(old_limit * 1.3, self.max_clip_limits['temporal'])
+                        if new_limit > old_limit:
+                            new_limits['temporal'] = new_limit
+                            changes_made = True
+                    
+                    # If category component is hitting >90% of clip limit, increase it
+                    if category_pct > 0.9:
+                        old_limit = self.current_clip_limits['category']
+                        new_limit = min(old_limit * 1.3, self.max_clip_limits['category'])
+                        if new_limit > old_limit:
+                            new_limits['category'] = new_limit
+                            changes_made = True
+                    
+                    # Apply changes if needed
+                    if changes_made:
+                        print(f"\nEpoch {epoch}: Special checkpoint - adjusting clip limits")
+                        if 'temporal' in new_limits:
+                            print(f"  - Increasing temporal limit from {self.current_clip_limits['temporal']:.2f} to {new_limits['temporal']:.2f}")
+                            self.current_clip_limits['temporal'] = new_limits['temporal']
+                        if 'category' in new_limits:
+                            print(f"  - Increasing category limit from {self.current_clip_limits['category']:.2f} to {new_limits['category']:.2f}")
+                            self.current_clip_limits['category'] = new_limits['category']
+                            
+                        # Reset statistics for affected components
+                        if 'temporal' in new_limits:
+                            self.utility_norm_stats['temporal_mean'] = 0.0
+                            self.utility_norm_stats['temporal_std'] = 1.0
+                        if 'category' in new_limits:
+                            self.utility_norm_stats['category_mean'] = 0.0
+                            self.utility_norm_stats['category_std'] = 1.0
+                        self.utility_norm_stats['update_count'] = 0
+                        
+                        clip_limits_changed = True
+            
+            # Reset early stopping counters if training conditions changed significantly
+            if clip_limits_changed or weights_changed:
+                significant_change = False
+                
+                if clip_limits_changed:
+                    print(f"Epoch {epoch}: Clip limits changed - resetting utility and balance early stopping counters")
+                    significant_change = True
+                    
+                if weights_changed:
+                    print(f"Epoch {epoch}: Component weights changed significantly - resetting utility early stopping counter")
+                    significant_change = True
+                
+                if significant_change:
+                    # Reset counters that would be affected by these changes
+                    no_improvement_counts['balanced_score'] = 0
+                    no_improvement_counts['utility_improvement'] = 0
+                    # Also reset metrics history to prevent false trends
+                    for key in ['spatial_loss_orig', 'temporal_loss_orig', 'category_loss_orig']:
+                        metrics_history[key] = []
+                    
+                    if self.use_wandb:
+                        wandb_metrics["early_stopping/counters_reset"] = True
+                        wandb_metrics["early_stopping/reset_reason"] = "clip_limits" if clip_limits_changed else "curriculum"
+            
             # Sample batch
             idx = np.random.randint(0, len(X_train[0]), batch_size)
             batch = [X[idx] for X in X_train]
@@ -704,18 +1332,84 @@ class RL_Enhanced_Transformer_TrajGAN():
             # Training step
             metrics = self.train_step(batch, batch_size)
             
-            # Log basic metrics to wandb
+            # Store metrics for next epoch's checks
+            self.last_epoch_metrics = {
+                'temporal_loss_orig': metrics.get('temporal_loss_orig', 0),
+                'category_loss_orig': metrics.get('category_loss_orig', 0)
+            }
+            
+            # Analyze clip limit impact
+            if all(k in metrics for k in ['temporal_loss_orig', 'category_loss_orig']):
+                # Check if components are hitting clip limits
+                temporal_pct = metrics['temporal_loss_orig'] / self.current_clip_limits['temporal'] * 100
+                category_pct = metrics['category_loss_orig'] / self.current_clip_limits['category'] * 100
+                
+                temporal_clipped = temporal_pct >= 99.0
+                category_clipped = category_pct >= 99.0
+                
+                # Only log warnings every 10 epochs to avoid spam
+                if epoch % 10 == 0 or temporal_clipped or category_clipped:
+                    components_clipped = []
+                    if temporal_clipped:
+                        components_clipped.append(f"Temporal ({temporal_pct:.1f}%)")
+                    if category_clipped:
+                        components_clipped.append(f"Category ({category_pct:.1f}%)")
+                    
+                    if components_clipped:
+                        print(f"\nEpoch {epoch}: WARNING - Components hitting clip limits: {', '.join(components_clipped)}")
+                        print(f"  - This may indicate gradient saturation and limited learning for these components")
+                        
+                        if epoch >= self.clip_increase_start_epoch:
+                            epochs_since_start = epoch - self.clip_increase_start_epoch
+                            next_update = self.clip_increase_start_epoch + ((epochs_since_start // self.clip_increase_frequency) + 1) * self.clip_increase_frequency
+                            print(f"  - Next clip limit increase scheduled for epoch {next_update}")
+                            
+                            # Manual intervention suggestion if next update is far away
+                            if next_update - epoch > 10 and (temporal_clipped or category_clipped):
+                                if temporal_clipped:
+                                    suggested_limit = round(self.current_clip_limits['temporal'] * 1.2, 1)
+                                    print(f"  - Consider manually increasing temporal clip limit to {suggested_limit}")
+                                if category_clipped:
+                                    suggested_limit = round(self.current_clip_limits['category'] * 1.2, 1)
+                                    print(f"  - Consider manually increasing category clip limit to {suggested_limit}")
+                    elif epoch % 10 == 0:
+                        # Report healthy status every 10 epochs
+                        print(f"\nEpoch {epoch}: Utility components within limits - "
+                              f"Temporal: {temporal_pct:.1f}%, Category: {category_pct:.1f}%")
+            
+            # Initialize metrics dictionary for logging
             wandb_metrics = {
                 "epoch": epoch,
                 "d_loss_real": metrics['d_loss_real'],
                 "d_loss_fake": metrics['d_loss_fake'],
                 "g_loss": metrics['g_loss'],
-                "c_loss": metrics['c_loss']
+                "c_loss": metrics['c_loss'],
+                "gen_updates": metrics['gen_updates']
             }
+            
+            # Add clip limit metrics
+            wandb_metrics["clip_limits/temporal"] = self.current_clip_limits['temporal']
+            wandb_metrics["clip_limits/category"] = self.current_clip_limits['category']
+            wandb_metrics["clip_limits/spatial"] = self.current_clip_limits['spatial']
+            
+            # Log curriculum learning weights
+            wandb_metrics["curriculum/spatial_weight"] = self.current_component_weights['spatial']
+            wandb_metrics["curriculum/temporal_weight"] = self.current_component_weights['temporal']
+            wandb_metrics["curriculum/category_weight"] = self.current_component_weights['category']
+            
+            # Calculate curriculum progress
+            if epoch >= self.curriculum_start_epoch and epoch < self.curriculum_start_epoch + self.curriculum_duration:
+                progress = (epoch - self.curriculum_start_epoch) / self.curriculum_duration
+                wandb_metrics["curriculum/progress"] = progress
+            elif epoch >= self.curriculum_start_epoch + self.curriculum_duration:
+                wandb_metrics["curriculum/progress"] = 1.0
+            else:
+                wandb_metrics["curriculum/progress"] = 0.0
             
             # Log reward component metrics
             reward_component_keys = [
                 'r_adv_raw', 'r_util_raw', 'r_priv_raw',
+                'r_adv_normalized', 'r_util_normalized', 
                 'r_adv', 'r_util', 'r_priv',
                 'rewards_mean', 'rewards_std', 'rewards_min', 'rewards_max'
             ]
@@ -723,14 +1417,25 @@ class RL_Enhanced_Transformer_TrajGAN():
                 if key in metrics:
                     wandb_metrics[f"reward_components/{key}"] = metrics[key]
             
-            # Log utility component metrics
+            # Log utility component metrics - both original and normalized
             utility_component_keys = [
                 'spatial_loss', 'temporal_loss', 'category_loss',
-                'spatial_component', 'temporal_component', 'category_component'
+                'spatial_component', 'temporal_component', 'category_component',
+                'spatial_loss_orig', 'temporal_loss_orig', 'category_loss_orig'
             ]
             for key in utility_component_keys:
                 if key in metrics:
                     wandb_metrics[f"utility_components/{key}"] = metrics[key]
+            
+            # Log normalization statistics
+            normalization_keys = [
+                'spatial_mean', 'spatial_std', 
+                'temporal_mean', 'temporal_std',
+                'category_mean', 'category_std'
+            ]
+            for key in normalization_keys:
+                if key in metrics:
+                    wandb_metrics[f"normalization/{key}"] = metrics[key]
                     
             # Log reward effectiveness metrics
             if 'tul_accuracy' in metrics:
@@ -740,95 +1445,301 @@ class RL_Enhanced_Transformer_TrajGAN():
             if all(k in metrics for k in ['r_adv', 'r_util', 'r_priv']):
                 total = abs(metrics['r_adv']) + abs(metrics['r_util']) + abs(metrics['r_priv'])
                 if total > 0:
-                    wandb_metrics["reward_effectiveness/adv_contribution"] = abs(metrics['r_adv']) / total
-                    wandb_metrics["reward_effectiveness/util_contribution"] = abs(metrics['r_util']) / total
-                    wandb_metrics["reward_effectiveness/priv_contribution"] = abs(metrics['r_priv']) / total
+                    adv_contribution = abs(metrics['r_adv']) / total
+                    util_contribution = abs(metrics['r_util']) / total
+                    priv_contribution = abs(metrics['r_priv']) / total
+                    
+                    wandb_metrics["reward_effectiveness/adv_contribution"] = adv_contribution
+                    wandb_metrics["reward_effectiveness/util_contribution"] = util_contribution
+                    wandb_metrics["reward_effectiveness/priv_contribution"] = priv_contribution
+            
+            # Calculate training balance metrics
+            d_avg_loss = (metrics['d_loss_real'] + metrics['d_loss_fake']) / 2
+            g_to_d_ratio = metrics['g_loss'] / (d_avg_loss + 1e-8)
+            d_real_to_fake_ratio = metrics['d_loss_real'] / (metrics['d_loss_fake'] + 1e-8)
+            
+            wandb_metrics["balance/g_to_d_loss_ratio"] = g_to_d_ratio
+            wandb_metrics["balance/d_real_to_fake_ratio"] = d_real_to_fake_ratio
+            
+            # Calculate utility component balance
+            if all(k in metrics for k in ['spatial_component', 'temporal_component', 'category_component']):
+                util_total = (abs(metrics['spatial_component']) + 
+                             abs(metrics['temporal_component']) + 
+                             abs(metrics['category_component']) + 1e-8)
+                
+                spatial_contribution = abs(metrics['spatial_component']) / util_total
+                temporal_contribution = abs(metrics['temporal_component']) / util_total
+                category_contribution = abs(metrics['category_component']) / util_total
+                
+                wandb_metrics["balance/spatial_contribution"] = spatial_contribution
+                wandb_metrics["balance/temporal_contribution"] = temporal_contribution
+                wandb_metrics["balance/category_contribution"] = category_contribution
+            
+            # Log % of clip limit used
+            if all(k in metrics for k in ['temporal_loss_orig', 'category_loss_orig']):
+                temporal_pct_used = metrics['temporal_loss_orig'] / self.current_clip_limits['temporal']
+                category_pct_used = metrics['category_loss_orig'] / self.current_clip_limits['category']
+                spatial_pct_used = metrics['spatial_loss_orig'] / self.current_clip_limits['spatial']
+                
+                wandb_metrics["clip_limits/temporal_pct_used"] = temporal_pct_used
+                wandb_metrics["clip_limits/category_pct_used"] = category_pct_used
+                wandb_metrics["clip_limits/spatial_pct_used"] = spatial_pct_used
+            
+            # Update metrics history
+            for key in metrics_history:
+                if key == 'd_loss':
+                    metrics_history[key].append(d_avg_loss)
+                elif key in metrics:
+                    metrics_history[key].append(metrics[key])
+            
+            # Keep only the most recent entries
+            for key in metrics_history:
+                metrics_history[key] = metrics_history[key][-history_window:]
+            
+            # ------------ Multi-metric early stopping logic ------------
+            if early_stopping and epoch >= history_window:
+                # 1. Traditional generator loss metric
+                current_g_loss = metrics['g_loss']
+                if current_g_loss < best_metrics['g_loss'] - min_delta:
+                    best_metrics['g_loss'] = current_g_loss
+                    best_epochs['g_loss'] = epoch
+                    no_improvement_counts['g_loss'] = 0
+                    # Save best model for this metric
+                    self.save_checkpoint(epoch, best=True, suffix='g_loss')
+                    if self.use_wandb:
+                        wandb_metrics["early_stopping/best_g_loss"] = current_g_loss
+                        wandb_metrics["early_stopping/best_g_loss_epoch"] = epoch
+                else:
+                    no_improvement_counts['g_loss'] += 1
+                
+                # 2. Balanced reward score (rewards should be balanced, not dominated by one component)
+                # Calculate balance score: higher when components are more equal
+                balance_score = 0
+                if all(k in metrics for k in ['r_adv', 'r_util', 'r_priv']):
+                    # Perfect balance would be 0.33, 0.33, 0.33
+                    ideal_contribution = 1.0 / 3.0
+                    balance_score = 1.0 - (
+                        abs(adv_contribution - ideal_contribution) +
+                        abs(util_contribution - ideal_contribution) +
+                        abs(priv_contribution - ideal_contribution)
+                    ) / 2.0  # Normalize to [0, 1]
+                    
+                    if self.use_wandb:
+                        wandb_metrics["early_stopping/balance_score"] = balance_score
+                    
+                    if balance_score > best_metrics['balanced_score'] + min_delta:
+                        best_metrics['balanced_score'] = balance_score
+                        best_epochs['balanced_score'] = epoch
+                        no_improvement_counts['balanced_score'] = 0
+                        # Save best model for this metric
+                        self.save_checkpoint(epoch, best=True, suffix='balance')
+                        if self.use_wandb:
+                            wandb_metrics["early_stopping/best_balance_score"] = balance_score
+                            wandb_metrics["early_stopping/best_balance_epoch"] = epoch
+                    else:
+                        no_improvement_counts['balanced_score'] += 1
+                
+                # 3. Utility improvement score
+                # Calculate trend in utility losses (looking for decreasing trend)
+                utility_trend = 0
+                if len(metrics_history['spatial_loss_orig']) >= history_window:
+                    # Calculate average improvement over window
+                    spatial_improvement = metrics_history['spatial_loss_orig'][0] - metrics_history['spatial_loss_orig'][-1]
+                    temporal_improvement = 0
+                    category_improvement = 0
+                    
+                    # Only consider temporal/category if they're not hitting clip limits consistently
+                    # Use a more relaxed threshold (90% instead of 99%) to allow more learning
+                    if metrics['temporal_loss_orig'] < self.current_clip_limits['temporal'] * 0.9:
+                        temporal_improvement = metrics_history['temporal_loss_orig'][0] - metrics_history['temporal_loss_orig'][-1]
+                    else:
+                        # Still give partial credit even when hitting clip limits
+                        # This helps the model continue learning even with clipped values
+                        temporal_improvement = 0.2 * (metrics_history['temporal_loss_orig'][0] - metrics_history['temporal_loss_orig'][-1])
+                    
+                    if metrics['category_loss_orig'] < self.current_clip_limits['category'] * 0.9:
+                        category_improvement = metrics_history['category_loss_orig'][0] - metrics_history['category_loss_orig'][-1]
+                    else:
+                        # Still give partial credit even when hitting clip limits
+                        category_improvement = 0.2 * (metrics_history['category_loss_orig'][0] - metrics_history['category_loss_orig'][-1])
+                    
+                    # Weight improvements based on current curriculum weights, but ensure temporal and category
+                    # are contributing even if they're smaller than spatial
+                    utility_trend = (
+                        self.current_component_weights['spatial'] * spatial_improvement +
+                        max(self.current_component_weights['temporal'], 0.3) * temporal_improvement +
+                        max(self.current_component_weights['category'], 0.3) * category_improvement
+                    )
+                    
+                    if self.use_wandb:
+                        wandb_metrics["early_stopping/utility_trend"] = utility_trend
+                    
+                    if utility_trend > best_metrics['utility_improvement'] + min_delta:
+                        best_metrics['utility_improvement'] = utility_trend
+                        best_epochs['utility_improvement'] = epoch
+                        no_improvement_counts['utility_improvement'] = 0
+                        # Save best model for this metric
+                        self.save_checkpoint(epoch, best=True, suffix='utility')
+                        if self.use_wandb:
+                            wandb_metrics["early_stopping/best_utility_trend"] = utility_trend
+                            wandb_metrics["early_stopping/best_utility_epoch"] = epoch
+                    else:
+                        no_improvement_counts['utility_improvement'] += 1
+                
+                # 4. Privacy score
+                privacy_score = 0
+                if 'tul_accuracy' in metrics:
+                    # Lower TUL accuracy is better for privacy
+                    privacy_score = 1.0 - metrics['tul_accuracy']
+                    
+                    if self.use_wandb:
+                        wandb_metrics["early_stopping/privacy_score"] = privacy_score
+                    
+                    if privacy_score > best_metrics['privacy_score'] + min_delta:
+                        best_metrics['privacy_score'] = privacy_score
+                        best_epochs['privacy_score'] = epoch
+                        no_improvement_counts['privacy_score'] = 0
+                        # Save best model for this metric
+                        self.save_checkpoint(epoch, best=True, suffix='privacy')
+                        if self.use_wandb:
+                            wandb_metrics["early_stopping/best_privacy_score"] = privacy_score
+                            wandb_metrics["early_stopping/best_privacy_epoch"] = epoch
+                    else:
+                        no_improvement_counts['privacy_score'] += 1
+                
+                # Calculate a weighted combined score for overall model quality
+                combined_score = 0
+                if all(k in metrics for k in ['r_adv', 'r_util', 'r_priv']) and 'tul_accuracy' in metrics:
+                    # Weight the different metrics based on importance
+                    g_loss_norm = min(1.0, 300.0 / (metrics['g_loss'] + 1e-8))  # Normalize generator loss
+                    
+                    combined_score = (
+                        0.3 * g_loss_norm +  # Generator loss
+                        0.3 * balance_score +  # Reward balance
+                        0.3 * min(1.0, utility_trend * 10) +  # Utility improvement trend
+                        0.1 * privacy_score  # Privacy score
+                    )
+                    
+                    if self.use_wandb:
+                        wandb_metrics["early_stopping/combined_score"] = combined_score
+                
+                # Check if multiple criteria suggest stopping
+                stop_count = sum(1 for count in no_improvement_counts.values() if count >= patience)
+                if self.use_wandb:
+                    wandb_metrics["early_stopping/criteria_suggesting_stop"] = stop_count
+                
+                # Don't trigger early stopping before clip limits have a chance to increase
+                min_epochs_before_stopping = max(self.clip_increase_start_epoch + 20, 
+                                               self.curriculum_start_epoch + 50)
+                
+                # If at least 3 criteria have not improved for patience epochs, stop training
+                # But only after giving curriculum learning and clip limits a chance to take effect
+                if stop_count >= 3 and epoch >= min_epochs_before_stopping:
+                    print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                    print(f"No improvement in {stop_count} out of {len(no_improvement_counts)} criteria for {patience} epochs")
+                    
+                    # Find the best overall model based on the most recent best epoch
+                    best_overall_epoch = max(best_epochs.values())
+                    best_metric = [k for k, v in best_epochs.items() if v == best_overall_epoch][0]
+                    
+                    print(f"Loading best overall model from epoch {best_overall_epoch} (best {best_metric})")
+                    self.load_checkpoint(best_overall_epoch, suffix=best_metric)
+                    
+                    # Log early stopping in wandb
+                    if self.use_wandb:
+                        wandb.run.summary["stopped_early"] = True
+                        wandb.run.summary["total_epochs"] = epoch + 1
+                        wandb.run.summary["best_overall_epoch"] = best_overall_epoch
+                        wandb.run.summary["best_overall_metric"] = best_metric
+                        
+                        for metric, best_epoch in best_epochs.items():
+                            wandb.run.summary[f"best_{metric}_epoch"] = best_epoch
+                    
+                    break
+                elif stop_count >= 3 and epoch < min_epochs_before_stopping:
+                    # Log that we're delaying early stopping to allow curriculum and clip limits to take effect
+                    print(f"\nEarly stopping criteria met ({stop_count}/4), but continuing until epoch {min_epochs_before_stopping}")
+                    print(f"Allowing curriculum learning (starts at {self.curriculum_start_epoch}) and " +
+                          f"clip limit increases (start at {self.clip_increase_start_epoch}) to take effect")
+                    if self.use_wandb:
+                        wandb_metrics["early_stopping/stopping_delayed"] = True
+                        wandb_metrics["early_stopping/min_epochs_required"] = min_epochs_before_stopping
             
             # Log all metrics to wandb
-            wandb.log(wandb_metrics)
+            if self.use_wandb:
+                wandb.log(wandb_metrics)
             
             # Print progress
             if epoch % 10 == 0:
                 print(f"Epoch {epoch}/{epochs}")
                 print(f"D_real: {metrics['d_loss_real']:.4f}, D_fake: {metrics['d_loss_fake']:.4f}, G: {metrics['g_loss']:.4f}, C: {metrics['c_loss']:.4f}")
                 print(f"Reward components - Adv: {metrics.get('r_adv', 0):.4f}, Util: {metrics.get('r_util', 0):.4f}, Priv: {metrics.get('r_priv', 0):.4f}")
+                print(f"Original utility losses - Spatial: {metrics.get('spatial_loss_orig', 0):.4f}, Temporal: {metrics.get('temporal_loss_orig', 0):.4f}, Category: {metrics.get('category_loss_orig', 0):.4f}")
+                print(f"Normalized utility losses - Spatial: {metrics.get('spatial_loss', 0):.4f}, Temporal: {metrics.get('temporal_loss', 0):.4f}, Category: {metrics.get('category_loss', 0):.4f}")
+                print(f"Clip limits - Spatial: {self.current_clip_limits['spatial']:.2f}, Temporal: {self.current_clip_limits['temporal']:.2f}, Category: {self.current_clip_limits['category']:.2f}")
+                print(f"Component weights - Spatial: {self.current_component_weights['spatial']:.3f}, Temporal: {self.current_component_weights['temporal']:.3f}, Category: {self.current_component_weights['category']:.3f}")
                 if 'tul_accuracy' in metrics:
                     print(f"TUL Classifier Accuracy: {metrics['tul_accuracy']:.4f}")
+                
+                if early_stopping and epoch >= history_window:
+                    print(f"Early stopping status - G Loss: {no_improvement_counts['g_loss']}/{patience}, " +
+                          f"Balance: {no_improvement_counts.get('balanced_score', 0)}/{patience}, " +
+                          f"Utility: {no_improvement_counts.get('utility_improvement', 0)}/{patience}, " +
+                          f"Privacy: {no_improvement_counts.get('privacy_score', 0)}/{patience}")
             
             # Save checkpoints
             if epoch % sample_interval == 0:
                 self.save_checkpoint(epoch)
                 
                 # Save to wandb
-                wandb.save(f'results/generator_{epoch}.weights.h5')
-                wandb.save(f'results/discriminator_{epoch}.weights.h5')
-                wandb.save(f'results/critic_{epoch}.weights.h5')
-            
-            # Early stopping check
-            if early_stopping:
-                current_loss = metrics['g_loss']
-                
-                if current_loss < best_g_loss - min_delta:
-                    best_g_loss = current_loss
-                    no_improvement_count = 0
-                    
-                    # Save best model
-                    self.save_checkpoint(epoch, best=True)
-                    wandb.run.summary["best_epoch"] = epoch
-                    wandb.run.summary["best_g_loss"] = best_g_loss
-                else:
-                    no_improvement_count += 1
-                    
-                # Log early stopping metrics
-                wandb.log({
-                    "best_g_loss": best_g_loss,
-                    "no_improvement_epochs": no_improvement_count
-                })
-                
-                if no_improvement_count >= patience:
-                    print(f"\nEarly stopping triggered after {epoch+1} epochs")
-                    
-                    # Load best model
-                    self.load_best_model()
-                  
-                    # Log early stopping in wandb
-                    wandb.run.summary["stopped_early"] = True
-                    wandb.run.summary["total_epochs"] = epoch + 1
-                    break
+                if self.use_wandb:
+                    wandb.save(f'results/generator_{epoch}.weights.h5')
+                    wandb.save(f'results/discriminator_{epoch}.weights.h5')
+                    wandb.save(f'results/critic_{epoch}.weights.h5')
         
         # Close wandb run
-        wandb.finish()
+        if self.use_wandb:
+            wandb.finish()
         
-    def save_checkpoint(self, epoch, best=False):
+    def save_checkpoint(self, epoch, best=False, suffix=''):
         """Save model checkpoints.
         
         Args:
             epoch: Current epoch number
             best: Whether this is the best model so far
+            suffix: Optional suffix to add to the filename (for multi-metric early stopping)
         """
         # Make sure the results directory exists
         os.makedirs('results', exist_ok=True)
         
+        # Build the prefix for the filename
+        if best and suffix:
+            prefix = f"best_{suffix}_"
+        elif best:
+            prefix = "best_"
+        else:
+            prefix = ""
+        
         # Save model weights
         try:
-            prefix = "best_" if best else ""
             self.generator.save_weights(f'results/{prefix}generator_{epoch}.weights.h5')
             self.discriminator.save_weights(f'results/{prefix}discriminator_{epoch}.weights.h5')
             self.critic.save_weights(f'results/{prefix}critic_{epoch}.weights.h5')
             
-            # Also save the most recent best model separately
+            # Also save the most recent best model separately if this is a best model
             if best:
-                self.generator.save_weights(f'results/best_generator.weights.h5')
-                self.discriminator.save_weights(f'results/best_discriminator.weights.h5')
-                self.critic.save_weights(f'results/best_critic.weights.h5')
+                self.generator.save_weights(f'results/{prefix}generator.weights.h5')
+                self.discriminator.save_weights(f'results/{prefix}discriminator.weights.h5')
+                self.critic.save_weights(f'results/{prefix}critic.weights.h5')
                 
-            print(f"Model weights saved for epoch {epoch}" + (" (best model)" if best else ""))
+            print(f"Model weights saved for epoch {epoch}" + 
+                  (" (best model)" if best and not suffix else "") +
+                  (f" (best {suffix} model)" if best and suffix else ""))
         except Exception as e:
             print(f"Warning: Could not save weights for epoch {epoch}: {e}")
         
         # Now try to save the full models with architecture
         try:
-            prefix = "best_" if best else ""
             # Save the Keras models
             self.generator.save(f'results/{prefix}generator_architecture_{epoch}.keras')
             self.discriminator.save(f'results/{prefix}discriminator_architecture_{epoch}.keras')
@@ -852,7 +1763,30 @@ class RL_Enhanced_Transformer_TrajGAN():
             print("Loaded best model weights")
         except Exception as e:
             print(f"Error loading best model: {e}")
-    
+            
+    def load_checkpoint(self, epoch, suffix=''):
+        """Load a specific checkpoint.
+        
+        Args:
+            epoch: The epoch number to load
+            suffix: Optional suffix in the filename (for multi-metric early stopping)
+        """
+        try:
+            # Build the prefix for the filename
+            if suffix:
+                prefix = f"best_{suffix}_"
+            else:
+                prefix = ""
+                
+            self.generator.load_weights(f'results/{prefix}generator_{epoch}.weights.h5')
+            self.discriminator.load_weights(f'results/{prefix}discriminator_{epoch}.weights.h5')
+            self.critic.load_weights(f'results/{prefix}critic_{epoch}.weights.h5')
+            print(f"Loaded model weights from epoch {epoch}" + 
+                  (f" (best {suffix} model)" if suffix else ""))
+        except Exception as e:
+            print(f"Error loading model from epoch {epoch}: {e}")
+            raise
+
     def update_actor(self, states, actions, advantages):
         """Update generator using a simplified policy gradient approach."""
         # Get a single batch of data with random noise for the generator
