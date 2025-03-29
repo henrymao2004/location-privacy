@@ -95,8 +95,8 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.w_semantic = 0.5   # Increased from 0.2
         
         # Define optimizers with REDUCED learning rates for stability
-        self.actor_optimizer = Adam(0.0005, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
-        self.critic_optimizer = Adam(0.0005, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
+        self.actor_optimizer = Adam(0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
+        self.critic_optimizer = Adam(0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
         self.discriminator_optimizer = Adam(0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
 
         # Build networks

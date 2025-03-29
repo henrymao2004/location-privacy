@@ -338,7 +338,7 @@ def main():
         config={
             "architecture": "RL_Enhanced_Transformer_TrajGAN",
             "epochs": 500,
-            "batch_size": 64,
+            "batch_size": 256,
             "latent_dim": 100,
             "max_length": 144,
             "rl_params": {
@@ -348,9 +348,14 @@ def main():
                 "ppo_epochs": 4
             },
             "reward_weights": {
-                "adversarial": 0.5,
-                "utility": 0.5,
-                "privacy": 0.5
+                "adversarial": 0.4,
+                "utility": 0.3,
+                "privacy": 0.4
+            },
+            "utility_weights": {
+                "spatial": 0.2,
+                "temporal": 0.3,
+                "semantic": 0.5
             },
             "early_stopping": {
                 "patience": 20,
@@ -415,7 +420,7 @@ def main():
     
     # Training parameters
     epochs = 500
-    batch_size = 64
+    batch_size = 256
     sample_interval = 5
     
     # Log model architecture as text
