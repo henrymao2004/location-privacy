@@ -16,7 +16,7 @@ class WandbModelCheckpoint:
         self.best_reward = float('-inf')
         self.best_epoch = 0
         self.patience = patience
-        self.no_improvement_count = 0
+        self.wait_count = 0  # Renamed from no_improvement_count for consistency
         self.should_stop = False
         # Store recent rewards to detect overfitting trends
         self.recent_rewards = deque(maxlen=5)
@@ -30,7 +30,7 @@ class WandbModelCheckpoint:
             if current_reward > self.best_reward:
                 self.best_reward = current_reward
                 self.best_epoch = epoch
-                self.no_improvement_count = 0
+                self.wait_count = 0  # Reset counter when improvement is found
                 
                 # Save best model
                 self.model.save_best_checkpoint(self.checkpoint_dir, self.best_model_name)
@@ -42,15 +42,15 @@ class WandbModelCheckpoint:
                 })
                 print(f"\nNew best model saved at epoch {epoch} with reward {current_reward:.4f}")
             else:
-                self.no_improvement_count += 1
+                self.wait_count += 1  # Increment counter when no improvement
                 
                 # Log early stopping metrics
                 wandb.log({
-                    "epochs_without_improvement": self.no_improvement_count
+                    "epochs_without_improvement": self.wait_count
                 })
                 
                 # Check if we should stop training
-                if self.no_improvement_count >= self.patience:
+                if self.wait_count >= self.patience:
                     self.should_stop = True
                     print(f"\nEarly stopping triggered after {self.patience} epochs without improvement")
                     print(f"Best model was at epoch {self.best_epoch} with reward {self.best_reward:.4f}")
