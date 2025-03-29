@@ -703,48 +703,71 @@ class RL_Enhanced_Transformer_TrajGAN():
             'category': self._compute_category_utility(real_trajs[1], gen_trajs[1], real_trajs[4])
         }
         
+        # Store original rewards for debugging and analysis
+        utility_rewards_orig = {k: tf.identity(v) for k, v in utility_rewards.items()}
+        
         # Apply clipping and normalization to utility rewards
         for component, reward in utility_rewards.items():
             # Clip rewards based on current limits
             clip_limit = self.current_clip_limits[component]
             
-            # Normalize rewards using running statistics if available
+            # First simple clipping to prevent extreme values
+            # This is essential to avoid outliers corrupting normalization
+            reward_clipped = tf.clip_by_value(reward, -clip_limit, clip_limit)
+            
+            # Extract stats for normalization
             stat_key = f"{component}_mean"
             std_key = f"{component}_std"
             
-            if self.utility_norm_stats['update_count'] > 50:  # Increased from 10
-                # Use a blend of identity and normalized rewards during transition
-                blend_factor = min(1.0, (self.utility_norm_stats['update_count'] - 50) / 100.0)
-                raw_clipped = tf.clip_by_value(reward, -clip_limit, clip_limit)
-                normalized_reward = (reward - mean) / (std + 1e-8)
-                normalized_clipped = tf.clip_by_value(normalized_reward, -clip_limit, clip_limit)
-                utility_rewards[component] = blend_factor * normalized_clipped + (1 - blend_factor) * raw_clipped
-            else:
-                # Just apply simple clipping in early phases when stats are not reliable
-                utility_rewards[component] = tf.clip_by_value(reward, -clip_limit, clip_limit)
-                
-            # Update running statistics with an exponential moving average
+            # Update running statistics with exponential moving average
+            # Always update statistics to maintain good estimates
+            current_mean = tf.reduce_mean(reward_clipped)
+            current_std = tf.math.reduce_std(reward_clipped) + 1e-8  # Add epsilon to avoid division by zero
+            
             if self.utility_norm_stats['update_count'] == 0:
-                # First update - set directly
-                self.utility_norm_stats[stat_key] = tf.reduce_mean(reward)
-                self.utility_norm_stats[std_key] = tf.math.reduce_std(reward)
+                # First update
+                self.utility_norm_stats[stat_key] = current_mean
+                self.utility_norm_stats[std_key] = current_std
             else:
-                # Subsequent updates - use exponential moving average
-                alpha = 0.05  # Small EMA coefficient for stable updates
-                
-                # Update mean
-                current_mean = tf.reduce_mean(reward)
+                # Use a smaller alpha for more stable estimates
+                alpha = 0.03
                 self.utility_norm_stats[stat_key] = (1 - alpha) * self.utility_norm_stats[stat_key] + alpha * current_mean
-                
-                # Update std
-                current_std = tf.math.reduce_std(reward)
                 self.utility_norm_stats[std_key] = (1 - alpha) * self.utility_norm_stats[std_key] + alpha * current_std
+            
+            # Apply normalization based on statistics
+            if self.utility_norm_stats['update_count'] > 30:
+                # Get mean and std from running statistics
+                mean = self.utility_norm_stats[stat_key]
+                std = self.utility_norm_stats[std_key]
+                
+                # Apply normalization only if standard deviation is significant
+                if std > 0.1:  # Threshold to avoid over-normalization of already small values
+                    # Calculate normalized rewards
+                    normalized_reward = (reward_clipped - mean) / std
+                    
+                    # Blend normalized rewards with original clipped rewards
+                    # Start with more weight on original, gradually shift to normalized
+                    blend_factor = min(0.8, (self.utility_norm_stats['update_count'] - 30) / 100.0)
+                    reward_processed = (blend_factor * normalized_reward + 
+                                      (1 - blend_factor) * reward_clipped)
+                    
+                    # Apply final clipping after normalization
+                    reward_processed = tf.clip_by_value(reward_processed, -clip_limit, clip_limit)
+                else:
+                    # If std is very small, just use clipped rewards
+                    reward_processed = reward_clipped
+            else:
+                # In early training, just use clipped rewards
+                reward_processed = reward_clipped
+            
+            # Store processed rewards
+            utility_rewards[component] = reward_processed
         
         # Increment update counter
         self.utility_norm_stats['update_count'] += 1
         
         # Log current utility stats
-        if self.utility_norm_stats['update_count'] % 100 == 0:
+        if self.utility_norm_stats['update_count'] % 50 == 0:
             print(f"Utility stats after {self.utility_norm_stats['update_count']} updates:")
             for key, value in self.utility_norm_stats.items():
                 if key != 'update_count':
@@ -753,11 +776,42 @@ class RL_Enhanced_Transformer_TrajGAN():
                     else:
                         print(f"  {key}: {value:.4f}")
         
-        # Combine utility rewards with component weights
+        # Calculate weighted utility combination - apply progressive boosting to underperforming components
+        # Get average values for each component to identify underperforming ones
+        avg_spatial = tf.reduce_mean(tf.abs(utility_rewards['spatial']))
+        avg_temporal = tf.reduce_mean(tf.abs(utility_rewards['temporal']))
+        avg_category = tf.reduce_mean(tf.abs(utility_rewards['category']))
+        
+        # Compute component ratios to identify relative performance
+        total_avg = avg_spatial + avg_temporal + avg_category + 1e-8
+        ratios = {
+            'spatial': avg_spatial / total_avg,
+            'temporal': avg_temporal / total_avg,
+            'category': avg_category / total_avg
+        }
+        
+        # Apply adaptive boosting to underperforming components
+        boost_factors = {}
+        for component, ratio in ratios.items():
+            # Boost components with lower ratios (underperforming)
+            if ratio < 0.25:  # Significant underperformance
+                boost_factors[component] = 1.4  # Strong boost
+            elif ratio < 0.33:  # Moderate underperformance
+                boost_factors[component] = 1.2  # Moderate boost
+            else:
+                boost_factors[component] = 1.0  # No boost
+        
+        # Apply boosting to component weights
+        boosted_weights = {
+            component: self.current_component_weights[component] * boost_factors.get(component, 1.0)
+            for component in self.current_component_weights
+        }
+        
+        # Combine utility rewards with boosted component weights
         combined_utility = (
-            self.current_component_weights['spatial'] * utility_rewards['spatial'] +
-            self.current_component_weights['temporal'] * utility_rewards['temporal'] +
-            self.current_component_weights['category'] * utility_rewards['category']
+            boosted_weights['spatial'] * utility_rewards['spatial'] +
+            boosted_weights['temporal'] * utility_rewards['temporal'] +
+            boosted_weights['category'] * utility_rewards['category']
         )
         
         # Compute privacy reward if TUL classifier is available
@@ -768,9 +822,11 @@ class RL_Enhanced_Transformer_TrajGAN():
             privacy_reward = tf.clip_by_value(privacy_reward, -5.0, 5.0)
         
         # Apply reward weights and combine all reward components
+        # Add utility bias term to ensure minimum utility contribution
+        utility_bias = 0.2  # Small bias to ensure utility signal always present
         final_reward = (
             self.w_adv * adv_reward +
-            self.w_util * combined_utility +
+            self.w_util * (combined_utility + utility_bias) +
             self.w_priv * privacy_reward
         )
         
@@ -782,11 +838,18 @@ class RL_Enhanced_Transformer_TrajGAN():
             'total': final_reward,
             'adversarial': adv_reward,
             'utility': combined_utility,
+            'utility_biased': combined_utility + utility_bias,
             'spatial': utility_rewards['spatial'],
             'temporal': utility_rewards['temporal'],
             'category': utility_rewards['category'],
+            'spatial_orig': utility_rewards_orig['spatial'],
+            'temporal_orig': utility_rewards_orig['temporal'],
+            'category_orig': utility_rewards_orig['category'],
+            'spatial_boost': boosted_weights['spatial'],
+            'temporal_boost': boosted_weights['temporal'],
+            'category_boost': boosted_weights['category'],
             'privacy': privacy_reward
-        }
+        }, utility_rewards_orig  # Return original rewards for logging and adaptive clipping
 
     def _compute_spatial_utility(self, real_latlon, gen_latlon, mask):
         """Compute spatial utility reward between real and generated lat/lon.
@@ -802,7 +865,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Calculate trajectory length from mask
         traj_length = tf.reduce_sum(mask, axis=1) + 1e-8
         
-        # Calculate mean squared error between real and generated lat/lon
+        # Calculate point-wise distances between real and generated points
         diff = gen_latlon - real_latlon
         squared_diff = diff * diff
         
@@ -810,14 +873,68 @@ class RL_Enhanced_Transformer_TrajGAN():
         mask_repeated = tf.repeat(mask, 2, axis=2)
         masked_squared_diff = squared_diff * mask_repeated
         
-        # Sum across spatial dimensions and sequence length
+        # Sum across spatial dimensions and sequence length to get MSE
         batch_size = tf.shape(real_latlon)[0]
         spatial_mse = tf.reduce_sum(tf.reduce_sum(
             masked_squared_diff, axis=1), axis=1, keepdims=True) / traj_length
         
-        # Higher reward for lower error (negative MSE)
-        # Scale reward to be proportional to error magnitude (avoid extreme values)
-        spatial_reward = -spatial_mse
+        # Calculate trajectory shape similarity (direction preservation)
+        # This captures how well the generated trajectory preserves directional changes
+        
+        # 1. Calculate displacement vectors for consecutive points
+        # For real trajectory
+        real_shifted = tf.concat([real_latlon[:, 1:, :], tf.zeros_like(real_latlon[:, :1, :])], axis=1)
+        real_vectors = real_shifted - real_latlon
+        
+        # For generated trajectory
+        gen_shifted = tf.concat([gen_latlon[:, 1:, :], tf.zeros_like(gen_latlon[:, :1, :])], axis=1)
+        gen_vectors = gen_shifted - gen_latlon
+        
+        # Create a mask for valid vector pairs (both points must be valid)
+        mask_shifted = tf.concat([mask[:, 1:, :], tf.zeros_like(mask[:, :1, :])], axis=1)
+        vector_mask = mask * mask_shifted  # Only points with valid next points
+        vector_mask_repeated = tf.repeat(vector_mask, 2, axis=2)
+        
+        # Apply mask to vectors
+        real_vectors_masked = real_vectors * vector_mask_repeated
+        gen_vectors_masked = gen_vectors * vector_mask_repeated
+        
+        # 2. Calculate vector magnitudes
+        real_magnitudes = tf.sqrt(tf.reduce_sum(real_vectors_masked * real_vectors_masked, axis=2, keepdims=True) + 1e-8)
+        gen_magnitudes = tf.sqrt(tf.reduce_sum(gen_vectors_masked * gen_vectors_masked, axis=2, keepdims=True) + 1e-8)
+        
+        # 3. Normalize vectors to get directions
+        real_directions = real_vectors_masked / (real_magnitudes + 1e-8)
+        gen_directions = gen_vectors_masked / (gen_magnitudes + 1e-8)
+        
+        # 4. Calculate dot product to get cosine similarity
+        cosine_sim = tf.reduce_sum(real_directions * gen_directions, axis=2, keepdims=True)
+        
+        # Apply vector mask again to ensure we're only considering valid points
+        cosine_sim_masked = cosine_sim * tf.squeeze(vector_mask, axis=2, name='squeezed_vector_mask')[:, :, tf.newaxis]
+        
+        # Average cosine similarity across the trajectory
+        valid_vector_count = tf.reduce_sum(vector_mask, axis=[1, 2]) + 1e-8
+        avg_cosine_sim = tf.reduce_sum(cosine_sim_masked, axis=1) / valid_vector_count[:, tf.newaxis]
+        
+        # Convert to a directional similarity score (-1 to 1)
+        # 1 means perfect directional alignment, -1 means opposite directions
+        direction_score = avg_cosine_sim
+        
+        # Higher reward for lower error (negative MSE) and better direction preservation
+        # Balance point-wise accuracy with trajectory shape preservation
+        point_weight = 0.7
+        direction_weight = 0.3
+        
+        # Compute the spatial reward combining both aspects
+        spatial_reward_points = -spatial_mse
+        spatial_reward_direction = direction_score  # Already in -1 to 1 range
+        
+        # Combine the rewards
+        spatial_reward = (
+            point_weight * spatial_reward_points + 
+            direction_weight * spatial_reward_direction
+        )
         
         # Apply scaling based on point density - reward denser trajectories
         point_density = traj_length / tf.cast(tf.shape(mask)[1], tf.float32)
@@ -842,11 +959,10 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Calculate trajectory length from mask
         traj_length = tf.reduce_sum(mask, axis=1) + 1e-8
         
-        # Calculate cross-entropy for days (better than KL-divergence for multi-class)
+        # Calculate cross-entropy for days and hours (point-wise accuracy)
         gen_day_clipped = tf.clip_by_value(gen_day, 1e-7, 1.0)
         day_ce = tf.keras.losses.categorical_crossentropy(real_day, gen_day_clipped)
         
-        # Calculate cross-entropy for hours
         gen_hour_clipped = tf.clip_by_value(gen_hour, 1e-7, 1.0)
         hour_ce = tf.keras.losses.categorical_crossentropy(real_hour, gen_hour_clipped)
         
@@ -859,24 +975,96 @@ class RL_Enhanced_Transformer_TrajGAN():
         day_ce_avg = tf.reduce_sum(day_ce_masked, axis=1, keepdims=True) / traj_length
         hour_ce_avg = tf.reduce_sum(hour_ce_masked, axis=1, keepdims=True) / traj_length
         
-        # Weight hour consistency more than day consistency
-        temporal_loss = 0.4 * day_ce_avg + 0.6 * hour_ce_avg
+        # Compute trajectory-level distribution similarity
+        # This captures if the overall temporal pattern (regardless of order) is preserved
         
-        # Higher reward for lower loss (negative CE)
-        temporal_reward = -temporal_loss
+        # 1. Calculate trajectory-level distribution of days and hours
+        # For real trajectory
+        real_day_dist = tf.reduce_sum(real_day * mask_flat[:, :, tf.newaxis], axis=1)
+        real_day_dist = real_day_dist / (tf.reduce_sum(real_day_dist, axis=1, keepdims=True) + 1e-8)
         
-        # Apply scaling based on trajectory complexity
-        # Compute day and hour diversity metrics
-        day_probs = tf.reduce_sum(real_day * mask_flat[:, :, tf.newaxis], axis=1)
-        day_probs = day_probs / (tf.reduce_sum(day_probs, axis=1, keepdims=True) + 1e-8)
-        day_entropy = -tf.reduce_sum(day_probs * tf.math.log(day_probs + 1e-8), axis=1, keepdims=True)
+        real_hour_dist = tf.reduce_sum(real_hour * mask_flat[:, :, tf.newaxis], axis=1)
+        real_hour_dist = real_hour_dist / (tf.reduce_sum(real_hour_dist, axis=1, keepdims=True) + 1e-8)
         
-        hour_probs = tf.reduce_sum(real_hour * mask_flat[:, :, tf.newaxis], axis=1)
-        hour_probs = hour_probs / (tf.reduce_sum(hour_probs, axis=1, keepdims=True) + 1e-8)
-        hour_entropy = -tf.reduce_sum(hour_probs * tf.math.log(hour_probs + 1e-8), axis=1, keepdims=True)
+        # For generated trajectory
+        gen_day_dist = tf.reduce_sum(gen_day * mask_flat[:, :, tf.newaxis], axis=1)
+        gen_day_dist = gen_day_dist / (tf.reduce_sum(gen_day_dist, axis=1, keepdims=True) + 1e-8)
         
-        # Scale reward based on temporal diversity (higher reward for more diverse temporal patterns)
-        complexity_factor = 1.0 + 0.3 * (day_entropy + hour_entropy) / 2.0
+        gen_hour_dist = tf.reduce_sum(gen_hour * mask_flat[:, :, tf.newaxis], axis=1)
+        gen_hour_dist = gen_hour_dist / (tf.reduce_sum(gen_hour_dist, axis=1, keepdims=True) + 1e-8)
+        
+        # 2. Calculate JS divergence (symmetric KL) between distributions
+        # For days
+        gen_day_dist_clipped = tf.clip_by_value(gen_day_dist, 1e-7, 1.0)
+        real_day_dist_clipped = tf.clip_by_value(real_day_dist, 1e-7, 1.0)
+        
+        m_day_dist = 0.5 * (gen_day_dist_clipped + real_day_dist_clipped)
+        kl_day_real_m = tf.reduce_sum(real_day_dist_clipped * tf.math.log(real_day_dist_clipped / m_day_dist + 1e-8), axis=1, keepdims=True)
+        kl_day_gen_m = tf.reduce_sum(gen_day_dist_clipped * tf.math.log(gen_day_dist_clipped / m_day_dist + 1e-8), axis=1, keepdims=True)
+        js_day = 0.5 * (kl_day_real_m + kl_day_gen_m)
+        
+        # For hours
+        gen_hour_dist_clipped = tf.clip_by_value(gen_hour_dist, 1e-7, 1.0)
+        real_hour_dist_clipped = tf.clip_by_value(real_hour_dist, 1e-7, 1.0)
+        
+        m_hour_dist = 0.5 * (gen_hour_dist_clipped + real_hour_dist_clipped)
+        kl_hour_real_m = tf.reduce_sum(real_hour_dist_clipped * tf.math.log(real_hour_dist_clipped / m_hour_dist + 1e-8), axis=1, keepdims=True)
+        kl_hour_gen_m = tf.reduce_sum(gen_hour_dist_clipped * tf.math.log(gen_hour_dist_clipped / m_hour_dist + 1e-8), axis=1, keepdims=True)
+        js_hour = 0.5 * (kl_hour_real_m + kl_hour_gen_m)
+        
+        # 3. Calculate temporal sequence consistency
+        # Create one-hot encoding of most likely day and hour for each point
+        real_day_idx = tf.argmax(real_day, axis=2)
+        gen_day_idx = tf.argmax(gen_day, axis=2)
+        
+        real_hour_idx = tf.argmax(real_hour, axis=2)
+        gen_hour_idx = tf.argmax(gen_hour, axis=2)
+        
+        # Calculate match ratios for consecutive points
+        # For days
+        day_match = tf.cast(tf.equal(real_day_idx, gen_day_idx), tf.float32)
+        day_match_masked = day_match * mask_flat
+        
+        # For hours
+        hour_match = tf.cast(tf.equal(real_hour_idx, gen_hour_idx), tf.float32)
+        hour_match_masked = hour_match * mask_flat
+        
+        # Calculate consecutive match consistency
+        # This rewards maintaining the same temporal pattern/sequence
+        day_match_shift = tf.concat([day_match_masked[:, 1:], tf.zeros_like(day_match_masked[:, :1])], axis=1)
+        hour_match_shift = tf.concat([hour_match_masked[:, 1:], tf.zeros_like(hour_match_masked[:, :1])], axis=1)
+        
+        day_consistency = tf.reduce_sum(day_match_masked * day_match_shift, axis=1, keepdims=True) / (traj_length - 1 + 1e-8)
+        hour_consistency = tf.reduce_sum(hour_match_masked * hour_match_shift, axis=1, keepdims=True) / (traj_length - 1 + 1e-8)
+        
+        # Combine all components with appropriate weights
+        # 1. Point-wise accuracy (negative CE)
+        point_accuracy = -(0.35 * day_ce_avg + 0.65 * hour_ce_avg)  # Hours are more important than days
+        
+        # 2. Distribution match (negative JS divergence)
+        dist_match = -(0.35 * js_day + 0.65 * js_hour)
+        
+        # 3. Sequence consistency
+        seq_consistency = 0.35 * day_consistency + 0.65 * hour_consistency
+        
+        # Combine all temporal aspects with weights
+        temporal_reward = (
+            0.4 * point_accuracy +   # Point accuracy
+            0.4 * dist_match +       # Distribution match 
+            0.2 * seq_consistency    # Sequence consistency
+        )
+        
+        # Apply scaling based on trajectory temporal diversity
+        # Compute day and hour diversity metrics from real data
+        day_entropy = -tf.reduce_sum(real_day_dist_clipped * tf.math.log(real_day_dist_clipped + 1e-8), axis=1, keepdims=True)
+        hour_entropy = -tf.reduce_sum(real_hour_dist_clipped * tf.math.log(real_hour_dist_clipped + 1e-8), axis=1, keepdims=True)
+        
+        # Normalize entropy to 0-1 range for scaling
+        day_entropy_norm = day_entropy / tf.math.log(tf.cast(7.0, tf.float32))  # 7 days
+        hour_entropy_norm = hour_entropy / tf.math.log(tf.cast(24.0, tf.float32))  # 24 hours
+        
+        # More diverse temporal patterns should get higher rewards
+        complexity_factor = 1.0 + 0.3 * (0.4 * day_entropy_norm + 0.6 * hour_entropy_norm)
         scaled_temporal_reward = temporal_reward * complexity_factor
         
         return scaled_temporal_reward
@@ -895,7 +1083,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Calculate trajectory length from mask
         traj_length = tf.reduce_sum(mask, axis=1) + 1e-8
         
-        # Calculate cross-entropy for categories
+        # Calculate point-wise cross-entropy for categories
         gen_cat_clipped = tf.clip_by_value(gen_cat, 1e-7, 1.0)
         cat_ce = tf.keras.losses.categorical_crossentropy(real_cat, gen_cat_clipped)
         
@@ -906,17 +1094,96 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Calculate average CE loss per trajectory
         cat_ce_avg = tf.reduce_sum(cat_ce_masked, axis=1, keepdims=True) / traj_length
         
-        # Higher reward for lower loss (negative CE)
-        category_reward = -cat_ce_avg
+        # Point-wise accuracy component (negative CE)
+        point_accuracy = -cat_ce_avg
+        
+        # Calculate trajectory-level category distribution
+        # For real trajectory
+        real_cat_dist = tf.reduce_sum(real_cat * mask_flat[:, :, tf.newaxis], axis=1)
+        real_cat_dist = real_cat_dist / (tf.reduce_sum(real_cat_dist, axis=1, keepdims=True) + 1e-8)
+        
+        # For generated trajectory
+        gen_cat_dist = tf.reduce_sum(gen_cat * mask_flat[:, :, tf.newaxis], axis=1)
+        gen_cat_dist = gen_cat_dist / (tf.reduce_sum(gen_cat_dist, axis=1, keepdims=True) + 1e-8)
+        
+        # Calculate JS divergence for category distributions
+        gen_cat_dist_clipped = tf.clip_by_value(gen_cat_dist, 1e-7, 1.0)
+        real_cat_dist_clipped = tf.clip_by_value(real_cat_dist, 1e-7, 1.0)
+        
+        m_cat_dist = 0.5 * (gen_cat_dist_clipped + real_cat_dist_clipped)
+        kl_cat_real_m = tf.reduce_sum(real_cat_dist_clipped * tf.math.log(real_cat_dist_clipped / m_cat_dist + 1e-8), axis=1, keepdims=True)
+        kl_cat_gen_m = tf.reduce_sum(gen_cat_dist_clipped * tf.math.log(gen_cat_dist_clipped / m_cat_dist + 1e-8), axis=1, keepdims=True)
+        js_cat = 0.5 * (kl_cat_real_m + kl_cat_gen_m)
+        
+        # Distribution match component (negative JS divergence)
+        dist_match = -js_cat
+        
+        # Calculate category sequence transitions
+        # Get most likely category for each point
+        real_cat_idx = tf.argmax(real_cat, axis=2)
+        gen_cat_idx = tf.argmax(gen_cat, axis=2)
+        
+        # First, calculate the accuracy of category prediction
+        cat_match = tf.cast(tf.equal(real_cat_idx, gen_cat_idx), tf.float32)
+        cat_match_masked = cat_match * mask_flat
+        cat_match_ratio = tf.reduce_sum(cat_match_masked, axis=1, keepdims=True) / traj_length
+        
+        # Calculate transition matrices for real and generated trajectories
+        # This captures the sequential patterns of category changes
+        
+        # For real trajectory
+        num_categories = tf.shape(real_cat)[2]
+        
+        # Create one-hot encodings for current and next categories
+        real_cat_one_hot = tf.one_hot(real_cat_idx, num_categories)
+        real_cat_next_one_hot = tf.concat([real_cat_one_hot[:, 1:], tf.zeros_like(real_cat_one_hot[:, :1])], axis=1)
+        
+        # Apply mask for valid transitions (both current and next point must be valid)
+        mask_next = tf.concat([mask_flat[:, 1:], tf.zeros_like(mask_flat[:, :1])], axis=1)
+        transition_mask = mask_flat * mask_next
+        
+        # Apply mask to one-hot encodings
+        real_cat_one_hot_masked = real_cat_one_hot * mask_flat[:, :, tf.newaxis]
+        real_cat_next_one_hot_masked = real_cat_next_one_hot * mask_next[:, :, tf.newaxis]
+        
+        # Compute transition probabilities
+        # For each category i, calculate P(next=j | current=i) for all j
+        # We'll simplify and just measure if the transitions match in pattern
+        
+        # Calculate consecutive match consistency
+        cat_match_shift = tf.concat([cat_match_masked[:, 1:], tf.zeros_like(cat_match_masked[:, :1])], axis=1)
+        transition_consistency = tf.reduce_sum(cat_match_masked * cat_match_shift * transition_mask, axis=1, keepdims=True) / (tf.reduce_sum(transition_mask, axis=1, keepdims=True) + 1e-8)
+        
+        # Compute category frequency similarity
+        # This captures how well the frequency of each category's appearances is preserved
+        
+        # Calculate category frequency profiles
+        real_cat_freq = tf.reduce_sum(real_cat_one_hot_masked, axis=1) / (traj_length[:, tf.newaxis] + 1e-8)
+        gen_cat_freq = tf.reduce_sum(tf.one_hot(gen_cat_idx, num_categories) * mask_flat[:, :, tf.newaxis], axis=1) / (traj_length[:, tf.newaxis] + 1e-8)
+        
+        # Calculate L1 distance between frequency profiles
+        freq_diff = tf.abs(gen_cat_freq - real_cat_freq)
+        freq_l1_dist = tf.reduce_sum(freq_diff, axis=1, keepdims=True)
+        
+        # Convert to similarity measure (higher is better)
+        freq_similarity = 1.0 - tf.minimum(freq_l1_dist, 1.0)  # Cap at 1.0 for extreme cases
+        
+        # Combine all components with weights
+        category_reward = (
+            0.4 * point_accuracy +        # Point-wise accuracy
+            0.3 * dist_match +            # Distribution match
+            0.15 * transition_consistency + # Transition pattern match
+            0.15 * freq_similarity        # Frequency profile match
+        )
         
         # Apply scaling based on category diversity
-        # Compute category distribution
-        cat_probs = tf.reduce_sum(real_cat * mask_flat[:, :, tf.newaxis], axis=1)
-        cat_probs = cat_probs / (tf.reduce_sum(cat_probs, axis=1, keepdims=True) + 1e-8)
-        cat_entropy = -tf.reduce_sum(cat_probs * tf.math.log(cat_probs + 1e-8), axis=1, keepdims=True)
+        cat_entropy = -tf.reduce_sum(real_cat_dist_clipped * tf.math.log(real_cat_dist_clipped + 1e-8), axis=1, keepdims=True)
         
-        # Scale reward based on category diversity
-        diversity_factor = 1.0 + 0.4 * cat_entropy  # More weight for diverse category distributions
+        # Normalize entropy to 0-1 range
+        cat_entropy_norm = cat_entropy / tf.math.log(tf.cast(tf.cast(num_categories, tf.float32), tf.float32))
+        
+        # Scale reward by diversity (higher for more diverse category distributions)
+        diversity_factor = 1.0 + 0.4 * cat_entropy_norm
         scaled_category_reward = category_reward * diversity_factor
         
         return scaled_category_reward
@@ -934,7 +1201,8 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.traj_loss.set_trajectories(real_trajs, gen_trajs)
         
         # Compute full rewards using the TUL classifier
-        rewards, reward_components = self.compute_rewards(real_trajs, gen_trajs, self.tul_classifier)
+        rewards_dict, utility_rewards_orig = self.compute_rewards(real_trajs, gen_trajs, self.tul_classifier)
+        rewards = rewards_dict['total']  # Extract total rewards
         
         # Compute advantages and returns for PPO
         values = self.critic.predict(real_trajs[:4])
@@ -951,7 +1219,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Update critic using returns
         c_loss = self.critic.train_on_batch(real_trajs[:4], returns)
         
-        # Update discriminator
+        # Update discriminator with two-step process - first basic update
         d_loss_real = self.discriminator.train_on_batch(
             real_trajs,  # Pass all inputs including mask
             np.ones((batch_size, 1))
@@ -961,9 +1229,24 @@ class RL_Enhanced_Transformer_TrajGAN():
             np.zeros((batch_size, 1))
         )
         
+        # Determine if any utility components are underperforming based on original rewards
+        utility_component_below_threshold = False
+        for component, reward in utility_rewards_orig.items():
+            mean_reward = tf.reduce_mean(reward)
+            if mean_reward < -5.0:  # If a component has very negative rewards
+                utility_component_below_threshold = True
+                print(f"Utility component {component} is underperforming with mean reward {mean_reward:.4f}")
+                break
+        
         # Update generator (actor) multiple times for each discriminator update
+        # Use more updates if utility components are underperforming
+        g_updates = self.gen_updates_per_disc
+        if utility_component_below_threshold:
+            g_updates += 2  # Add extra updates to improve utility
+            print(f"Increasing generator updates to {g_updates} due to underperforming utility")
+        
         g_loss_total = 0
-        for i in range(self.gen_updates_per_disc):
+        for i in range(g_updates):
             # Generate new noise for each update to increase diversity
             noise_gen = np.random.normal(0, 1, (batch_size, self.latent_dim))
             
@@ -976,18 +1259,30 @@ class RL_Enhanced_Transformer_TrajGAN():
                 gen_trajs_new = [tf.cast(tensor, tf.float32) for tensor in gen_trajs_new]
                 
                 # Compute rewards for the new trajectories
-                rewards_new, _ = self.compute_rewards(real_trajs, gen_trajs_new, self.tul_classifier)
+                rewards_dict_new, _ = self.compute_rewards(real_trajs, gen_trajs_new, self.tul_classifier)
+                rewards_new = rewards_dict_new['total']
                 
                 # Compute advantages for the new trajectories
                 values_new = self.critic.predict(real_trajs[:4])
                 values_new = tf.cast(values_new, tf.float32)
                 advantages_new = compute_advantage(rewards_new, values_new, self.gamma, self.gae_lambda)
                 
+                # Adaptively weight utility-focused advantages
+                if utility_component_below_threshold and i >= 2:
+                    # For later updates, focus more on utility components
+                    utility_advantages = compute_advantage(
+                        rewards_dict_new['utility_biased'], values_new, self.gamma, self.gae_lambda)
+                    # Blend utility and total advantages
+                    blend_factor = 0.6  # 60% utility, 40% total rewards
+                    advantages_new = (blend_factor * utility_advantages + 
+                                     (1.0 - blend_factor) * advantages_new)
+                    print(f"Update {i}: Using utility-focused advantages (blend factor: {blend_factor})")
+                
                 # Update generator with new advantages
                 g_loss = self.update_actor(real_trajs, gen_trajs_new, advantages_new)
                 
                 # Update critic with new returns if this isn't the last generator update
-                if i < self.gen_updates_per_disc - 1:
+                if i < g_updates - 1:
                     returns_new = compute_returns(rewards_new, self.gamma)
                     if returns_new.shape[0] != batch_size:
                         returns_new = tf.reshape(returns_new, [batch_size, 1])
@@ -999,7 +1294,22 @@ class RL_Enhanced_Transformer_TrajGAN():
             g_loss_total += g_loss
         
         # Average the generator loss over all updates
-        g_loss = g_loss_total / self.gen_updates_per_disc
+        g_loss = g_loss_total / g_updates
+        
+        # After generator updates, do a focused discriminator update to maintain balance
+        if utility_component_below_threshold:
+            # Generate new trajectories for an extra discriminator update
+            noise_disc = np.random.normal(0, 1, (batch_size, self.latent_dim))
+            gen_trajs_disc = self.generator.predict([*real_trajs, noise_disc])
+            
+            # Extra discriminator update focused on newest generated samples
+            d_loss_fake_extra = self.discriminator.train_on_batch(
+                gen_trajs_disc,
+                np.zeros((batch_size, 1))
+            )
+            
+            # Average the fake losses
+            d_loss_fake = (d_loss_fake + d_loss_fake_extra) / 2
         
         # Add the reward components to the metrics
         metrics = {
@@ -1007,15 +1317,21 @@ class RL_Enhanced_Transformer_TrajGAN():
             "d_loss_fake": d_loss_fake, 
             "g_loss": g_loss, 
             "c_loss": c_loss,
-            "gen_updates": self.gen_updates_per_disc  # Track number of generator updates
+            "gen_updates": g_updates  # Track number of generator updates
         }
         
         # Add reward component metrics
-        for key, value in reward_components.items():
+        for key, value in rewards_dict.items():
             if isinstance(value, tf.Tensor):
                 metrics[key] = value.numpy().mean()
             else:
                 metrics[key] = value
+        
+        # Add original utility metrics for monitoring clip limits
+        for component in ['spatial', 'temporal', 'category']:
+            orig_key = f"{component}_orig"
+            if orig_key in rewards_dict and isinstance(rewards_dict[orig_key], tf.Tensor):
+                metrics[f"{component}_loss_orig"] = tf.reduce_mean(tf.abs(rewards_dict[orig_key])).numpy()
                 
         return metrics
 
@@ -1810,36 +2126,65 @@ class RL_Enhanced_Transformer_TrajGAN():
             # Then convert to numpy and flatten
             advantages_np = advantages.numpy().flatten()  # Flatten to ensure it's 1D
             
-            # Scale advantages to be positive (sample_weight should be positive)
-            advantages_np = advantages_np - np.min(advantages_np) + 1e-3
+            # Analyze advantage distribution
+            adv_mean = np.mean(advantages_np)
+            adv_std = np.std(advantages_np) + 1e-8  # Avoid division by zero
+            adv_min = np.min(advantages_np)
+            adv_max = np.max(advantages_np)
             
-            # Normalize to reasonable values (0 to 1 range)
-            if np.max(advantages_np) > 0:
-                advantages_np = advantages_np / np.max(advantages_np)
-                
+            # Apply normalization to stabilize training
+            # Center and scale advantages for more stable policy updates
+            advantages_normalized = (advantages_np - adv_mean) / adv_std
+            
+            # Convert to positive weights for sample_weight (must be positive)
+            # Use softmax-like normalization to maintain relative ordering
+            # but ensure all values are positive and sum to batch_size
+            advantages_exp = np.exp(np.clip(advantages_normalized, -5.0, 5.0))  # exp(clipped) for numerical stability
+            advantages_weight = advantages_exp / (np.mean(advantages_exp) + 1e-8) # Normalize to reasonable values
+            
+            # Apply minimum weight threshold to ensure all samples contribute
+            min_weight = 0.1  # Minimum sample weight
+            advantages_weight = np.maximum(advantages_weight, min_weight)
+            
+            # Apply non-linear weighting to emphasize high-advantage samples
+            # This gives more weight to samples with higher advantages
+            # Square function gives more weight to positive outliers
+            advantages_weight = np.sign(advantages_weight) * np.square(np.abs(advantages_weight))
+            
+            # Final normalization to keep mean close to 1.0
+            advantages_weight = advantages_weight / (np.mean(advantages_weight) + 1e-8)
+            
             # Ensure it has the right shape
-            if len(advantages_np) != batch_size:
-                print(f"Warning: Reshaping advantages from {len(advantages_np)} to {batch_size}")
+            if len(advantages_weight) != batch_size:
+                print(f"Warning: Reshaping advantages from {len(advantages_weight)} to {batch_size}")
                 # If shapes don't match, use uniform weights
-                advantages_np = np.ones(batch_size)
+                advantages_weight = np.ones(batch_size)
                 
             # Final safety check - replace any NaN or inf values
-            advantages_np = np.nan_to_num(advantages_np, nan=0.5, posinf=1.0, neginf=0.0)
+            advantages_weight = np.nan_to_num(advantages_weight, nan=1.0, posinf=2.0, neginf=0.1)
                 
         except Exception as e:
             print(f"Error processing advantages: {e}")
             # Fallback to uniform weights
-            advantages_np = np.ones(batch_size)
+            advantages_weight = np.ones(batch_size)
             
         # Print statistics about advantage values used for training
-        print(f"Advantage stats - min: {np.min(advantages_np):.4f}, max: {np.max(advantages_np):.4f}, " +
-              f"mean: {np.mean(advantages_np):.4f}, std: {np.std(advantages_np):.4f}")
+        print(f"Advantage stats - min: {adv_min:.4f}, max: {adv_max:.4f}, " +
+              f"mean: {adv_mean:.4f}, std: {adv_std:.4f}")
+        print(f"Weight stats - min: {np.min(advantages_weight):.4f}, max: {np.max(advantages_weight):.4f}, " +
+              f"mean: {np.mean(advantages_weight):.4f}, std: {np.std(advantages_weight):.4f}")
+        
+        # Apply gradient clipping to combined model for more stable updates
+        # This is done by setting clipnorm on the optimizer
+        # We'll set this dynamically based on the advantage statistics
+        clipnorm = 0.5 + 0.1 * np.log(1.0 + adv_std)  # Adaptive clip norm based on advantage spread
+        self.actor_optimizer.clipnorm = clipnorm
         
         # Train the combined model with sample weights from advantages
         loss = self.combined.train_on_batch(
             all_inputs, 
             targets,
-            sample_weight=advantages_np
+            sample_weight=advantages_weight
         )
         
         # If loss is extremely high, clip it for reporting purposes
