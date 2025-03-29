@@ -85,55 +85,55 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.gamma = 0.99  # discount factor
         self.gae_lambda = 0.95  # GAE parameter
         self.clip_epsilon = 0.2  # PPO clip parameter
-        self.c1 = 0.4  # value function coefficient (reduced from 0.5)
-        self.c2 = 0.005  # entropy coefficient (reduced from 0.01)
-        self.ppo_epochs = 3  # Number of PPO epochs per batch (reduced from 4)
+        self.c1 = 0.3  # value function coefficient (reduced further to prevent over-conservatism)
+        self.c2 = 0.01  # entropy coefficient (increased for more exploration in utility space)
+        self.ppo_epochs = 4  # Number of PPO epochs per batch (increased back to encourage better policy updates)
         
         # Generator-Discriminator balance parameter - increase gen updates for better learning
-        self.gen_updates_per_disc = 4  # Update generator this many times per discriminator update (increased from 3)
+        self.gen_updates_per_disc = 5  # Update generator this many times per discriminator update (increased further)
         
         # Dynamic clip limits - updated based on baseline analysis
         self.initial_clip_limits = {
-            'spatial': 5.0,    # Reduce from 10.0 to focus on better spatial learning
-            'temporal': 6.0,   # Reduce from 12.0
-            'category': 5.0    # Reduce from 12.0
+            'spatial': 8.0,    # Increased to allow more spatial exploration
+            'temporal': 8.0,   # Increased to allow more temporal flexibility
+            'category': 8.0    # Increased to allow more category flexibility
         }
         self.max_clip_limits = {
-            'spatial': 8.0,     # Keep lower than before
-            'temporal': 15.0,   # Reduce from 35.0
-            'category': 12.0    # Reduce from 25.0
+            'spatial': 12.0,     # Increased to allow better learning
+            'temporal': 20.0,    # Increased to allow better learning
+            'category': 15.0     # Increased to allow better learning
         }
-        self.clip_increase_start_epoch = 30  # Start increasing clips earlier (was 50)
-        self.clip_increase_frequency = 10    # Increase clip limits more frequently (was 15)
-        self.clip_increase_rate = 0.15       # Slower increase rate (was 0.25)
+        self.clip_increase_start_epoch = 20  # Start increasing clips earlier (was 30)
+        self.clip_increase_frequency = 8     # Increase clip limits more frequently (was 10)
+        self.clip_increase_rate = 0.2        # Faster increase rate (was 0.15)
         self.current_clip_limits = self.initial_clip_limits.copy()
         self.current_epoch = 0  # Track current epoch for clip limit adjustment
         
         # Load or initialize TUL classifier for privacy rewards
         self.tul_classifier = self.load_tul_classifier()
         
-        # Balanced reward weights - adjusted based on baseline analysis
-        self.w_adv = 0.4    # Further reduce adversarial weight
-        self.w_util = 1.0   # Increase utility weight
-        self.w_priv = 0.3   # Keep privacy weight
+        # Balanced reward weights - significantly adjusted to prioritize utility
+        self.w_adv = 0.3    # Reduce adversarial weight
+        self.w_util = 1.5   # Significantly increase utility weight
+        self.w_priv = 0.2   # Keep privacy weight lower to avoid overwhelming utility
             
-        # Initial utility component weights - match baseline performance
+        # Initial utility component weights - more balanced from the start
         self.initial_component_weights = {
-            'spatial': 0.8,     # Higher emphasis on spatial (was 0.6)
-            'temporal': 0.5,    # Higher initial weight for temporal (was 0.3)
-            'category': 0.4     # Higher initial weight for category (was 0.3)
+            'spatial': 0.8,     # Keep high emphasis on spatial
+            'temporal': 0.7,    # Higher initial weight for temporal
+            'category': 0.6     # Higher initial weight for category
         }
         
         # Target utility component weights - more balanced for better utility metrics
         self.target_component_weights = {
-            'spatial': 0.7,     # Maintain strong spatial emphasis (was 0.5)
-            'temporal': 0.6,    # Higher temporal weight (was 0.5)
-            'category': 0.6     # Higher category weight (was 0.5)
+            'spatial': 0.7,     # Slightly lower spatial emphasis to balance with others
+            'temporal': 0.8,    # Higher temporal weight for better temporal patterns
+            'category': 0.7     # Higher category weight for better category matching
         }
         
-        # Curriculum learning parameters - faster convergence
-        self.curriculum_start_epoch = 30      # Delay curriculum start
-        self.curriculum_duration = 200        # Longer transition period
+        # Curriculum learning parameters - faster utility convergence
+        self.curriculum_start_epoch = 20      # Start curriculum earlier
+        self.curriculum_duration = 150        # Shorter transition period for faster adaptation
         
         # Current utility component weights (will be updated during training)
         self.current_component_weights = self.initial_component_weights.copy()
