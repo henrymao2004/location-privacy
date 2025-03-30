@@ -385,7 +385,7 @@ loaded_model_json = json_file.read()
 json_file.close()
 
 classifier2 = recreate_model_structure()  # You'd need to define this function
-classifier2.load_weights('MARC/weights/MARC_Weight.h5')
+classifier2.load_weights('MARC/MARC_Weight.h5')
 
 pred_y_test = np.array(classifier2.predict(cls_x_test))
 (test_acc,

@@ -1,7 +1,7 @@
 import tensorflow as tf
 from tensorflow.keras.layers import (
     Layer, Dense, LayerNormalization, MultiHeadAttention, Dropout,
-    Input, Concatenate, Embedding, GlobalAveragePooling1D
+    Input, Concatenate, Embedding, GlobalAveragePooling1D, Lambda
 )
 import numpy as np
 
@@ -95,23 +95,69 @@ class TransformerDecoderLayer(Layer):
         
         return self.layernorm3(out2 + ffn_output)
 
+class PaddingMaskLayer(Layer):
+    """Layer to create padding mask compatible with Keras Functional API"""
+    def __init__(self, **kwargs):
+        super(PaddingMaskLayer, self).__init__(**kwargs)
+        
+    def call(self, seq):
+        # Create mask from sequence where 1 indicates padded positions
+        eq_zero = tf.math.equal(seq, 0)
+        mask = tf.cast(eq_zero, tf.float32)
+        # Add dimensions for attention broadcasting
+        return mask[:, tf.newaxis, tf.newaxis, :]  # (batch_size, 1, 1, seq_len)
+    
+    def get_config(self):
+        return super().get_config()
+
+class LookAheadMaskLayer(Layer):
+    """Layer to create look-ahead mask compatible with Keras Functional API"""
+    def __init__(self, **kwargs):
+        super(LookAheadMaskLayer, self).__init__(**kwargs)
+    
+    def call(self, inputs):
+        # inputs is used only to get the sequence length
+        size = tf.shape(inputs)[1]
+        # Create mask to prevent attention to future tokens
+        mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
+        return mask  # (size, size)
+    
+    def get_config(self):
+        return super().get_config()
+
+class CombinedMaskLayer(Layer):
+    """Layer to combine padding mask and look-ahead mask"""
+    def __init__(self, **kwargs):
+        super(CombinedMaskLayer, self).__init__(**kwargs)
+        self.padding_mask_layer = PaddingMaskLayer()
+        self.look_ahead_mask_layer = LookAheadMaskLayer()
+    
+    def call(self, inputs):
+        seq = inputs
+        size = tf.shape(seq)[1]
+        
+        pad_mask = self.padding_mask_layer(seq)
+        look_ahead_mask = self.look_ahead_mask_layer(seq)
+        
+        combined = tf.maximum(pad_mask, look_ahead_mask)
+        return combined
+    
+    def get_config(self):
+        return super().get_config()
+
+# For backwards compatibility, provide functional versions of the mask functions
 def create_padding_mask(seq):
-    # Create mask from sequence where 1 indicates padded positions (for transformer attention)
-    # Use with keys/values to mask out padded positions
-    seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
-    return seq[:, tf.newaxis, tf.newaxis, :]  # (batch_size, 1, 1, seq_len)
+    """Creates padding mask in functional style (not for use in Keras models)"""
+    mask_layer = PaddingMaskLayer()
+    return mask_layer(seq)
 
 def create_look_ahead_mask(size):
-    # Create mask to prevent attention to future tokens in sequence
-    # Used for decoder self-attention to ensure prediction at position i 
-    # can only depend on known outputs at positions < i
+    """Creates look-ahead mask in functional style (not for use in Keras models)"""
+    # For compatibility with existing code, but use the layer version for model building
     mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
-    return mask  # (size, size)
+    return mask
 
 def combined_mask(seq, size):
-    # Combines padding mask and look-ahead mask for decoder
-    pad_mask = create_padding_mask(seq)
-    look_ahead_mask = create_look_ahead_mask(size)
-    
-    combined = tf.maximum(pad_mask, look_ahead_mask)
-    return combined 
+    """Combines padding and look-ahead masks in functional style (not for use in Keras models)"""
+    mask_layer = CombinedMaskLayer()
+    return mask_layer(seq) 
