@@ -2,17 +2,16 @@ import tensorflow as tf
 import keras
 import numpy as np
 import random
-import scipy.spatial.distance as distance
+from tensorflow.keras import layers
+import tensorflow_probability as tfp
 import os
-from datetime import datetime
+import json
 
-# Set random seeds for reproducibility
 random.seed(2020)
 np.random.seed(2020)
 tf.random.set_seed(2020)
 
-from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding
-from keras.layers import MultiHeadAttention, LayerNormalization, Dropout, GlobalAveragePooling1D
+from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, MultiHeadAttention, LayerNormalization, Dropout
 from keras.initializers import he_uniform
 from keras.regularizers import l1
 
@@ -20,55 +19,47 @@ from keras.models import Sequential, Model
 from keras.optimizers import Adam
 from keras.preprocessing.sequence import pad_sequences
 
-# Define custom layer for expanding noise
-class ExpandNoise(tf.keras.layers.Layer):
-    def __init__(self, max_length, **kwargs):
-        super(ExpandNoise, self).__init__(**kwargs)
-        self.max_length = max_length
+from losses import d_bce_loss, trajLoss, TrajLossLayer, CustomTrajLoss, compute_advantage, compute_returns, compute_trajectory_ratio, compute_entropy_loss
+
+class TransformerBlock(layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
+        super(TransformerBlock, self).__init__()
         
-    def call(self, inputs):
-        return tf.tile(tf.expand_dims(inputs, 1), [1, self.max_length, 1])
-    
-    def compute_output_shape(self, input_shape):
-        return (input_shape[0], self.max_length, input_shape[1])
-            
-# Transformer encoder block implementation
-def transformer_encoder_block(inputs, head_size, num_heads, ff_dim, dropout=0):
-    # Multi-head attention
-    attention_output = MultiHeadAttention(
-        key_dim=head_size, num_heads=num_heads, dropout=dropout
-    )(inputs, inputs)
-    
-    # Add & normalize (first residual connection)
-    x = LayerNormalization(epsilon=1e-6)(inputs + attention_output)
-    
-    # Feed Forward network
-    ff_output = Dense(ff_dim, activation="relu")(x)
-    ff_output = Dense(inputs.shape[-1])(ff_output)
-    
-    # Add & normalize (second residual connection)
-    return LayerNormalization(epsilon=1e-6)(x + ff_output)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.rate = rate
+        
+        self.att = MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = Sequential([
+            Dense(ff_dim, activation="relu"),
+            Dense(embed_dim),
+        ])
+        
+        self.layernorm1 = LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        self.dropout1 = Dropout(rate)
+        self.dropout2 = Dropout(rate)
 
-def positional_encoding(length, depth, use_both=False):
-    positions = np.arange(length)[:, np.newaxis]
-    depths = np.arange(depth)[np.newaxis, :]/depth
+    def call(self, inputs, training):
+        attn_output = self.att(inputs, inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
     
-    angle_rates = 1 / (10000**depths)
-    angle_rads = positions * angle_rates
-    
-    if use_both:
-        pos_encoding = np.concatenate(
-            [np.sin(angle_rads), np.cos(angle_rads)],
-            axis=-1)
-    else:
-        # Just use sine for even indices and cosine for odd indices
-        pos_encoding = np.zeros((length, depth))
-        pos_encoding[:, 0::2] = np.sin(angle_rads[:, 0:depth:2])
-        pos_encoding[:, 1::2] = np.cos(angle_rads[:, 0:depth:2])
-    
-    return tf.cast(pos_encoding, dtype=tf.float32)
+    def get_config(self):
+        config = super(TransformerBlock, self).get_config()
+        config.update({
+            "embed_dim": self.embed_dim,
+            "num_heads": self.num_heads,
+            "ff_dim": self.ff_dim,
+            "rate": self.rate,
+        })
+        return config
 
-class RL_Transformer_TrajGAN():
+class RL_Enhanced_Transformer_TrajGAN():
     def __init__(self, latent_dim, keys, vocab_size, max_length, lat_centroid, lon_centroid, scale_factor):
         self.latent_dim = latent_dim
         self.max_length = max_length
@@ -82,845 +73,745 @@ class RL_Transformer_TrajGAN():
         
         self.x_train = None
         
-        # Transformer hyperparameters
-        self.head_size = 64
-        self.num_heads = 8
-        self.ff_dim = 256
-        self.transformer_blocks = 4
-        self.dropout_rate = 0.1
+        # RL parameters
+        self.gamma = 0.99  # discount factor
+        self.gae_lambda = 0.95  # GAE parameter
+        self.clip_epsilon = 0.2  # PPO clip parameter
+        self.c1 = 0.5  # value function coefficient (reduced)
+        self.c2 = 0.01  # entropy coefficient
+        self.ppo_epochs = 4  # Number of PPO epochs per batch
         
-        # Define the optimizers
-        self.generator_optimizer = Adam(0.001, 0.5)
-        self.discriminator_optimizer = Adam(0.001, 0.5)
-        self.critic_optimizer = Adam(0.001)
-        self.actor_optimizer = Adam(0.0005)
+        # Load or initialize TUL classifier for privacy rewards
+        self.tul_classifier = self.load_tul_classifier()
+        
+        # Define reward weights
+        self.w_adv = 0.5  # Weight for adversarial reward (reduced)
+        self.w_util = 0.5  # Weight for utility reward (reduced)
+        self.w_priv = 0.5  # Weight for privacy reward (reduced)
+        
+        # Define utility component weights
+        self.beta = 0.5   # Spatial loss weight (reduced)
+        self.gamma = 0.2  # Temporal loss weight (reduced)
+        self.chi = 0.2    # Category loss weight (reduced)
+        self.alpha = 0.5  # Privacy strength weight (reduced)
+        
+        # Define optimizers with reduced learning rates and gradient clipping
+        self.actor_optimizer = Adam(0.00001, clipnorm=1.0)  # Reduced from 0.00005
+        self.critic_optimizer = Adam(0.00001, clipnorm=1.0)  # Reduced from 0.00005
+        self.discriminator_optimizer = Adam(0.000005, clipnorm=1.0)  # Reduced from 0.00001
 
-        # PPO hyperparameters
-        self.ppo_epsilon = 0.2  # Clipping parameter
-        self.value_coeff = 0.5  # Value function coefficient
-        self.entropy_coeff = 0.01  # Entropy coefficient
-        
-        # Reward hyperparameters
-        self.alpha = 0.2  # Privacy weight
-        self.beta = 0.6   # Utility weight
-        self.gamma = 0.2  # Adversarial (realism) weight
-        
-        # Build actor-critic model for RL
-        self.actor_model, self.critic_model = self.build_actor_critic()
-        
-        # Build the trajectory discriminator
+        # Build networks
+        self.generator = self.build_generator()
+        self.critic = self.build_critic()
         self.discriminator = self.build_discriminator()
-        self.discriminator.compile(loss='binary_crossentropy', 
-                                  optimizer=self.discriminator_optimizer, 
-                                  metrics=['accuracy'])
         
-        # Build the TUL model for privacy evaluation
-        self.tul_model = self.build_tul_model()
-        self.tul_model.compile(loss='sparse_categorical_crossentropy',
-                              optimizer=Adam(0.001),
-                              metrics=['accuracy'])
+        # Compile models
+        self.discriminator.compile(loss='binary_crossentropy', optimizer=self.discriminator_optimizer)
+        self.critic.compile(loss='mse', optimizer=self.critic_optimizer)
         
-        # Evaluation buffer (for computing rewards)
-        self.replay_buffer = {
-            'states': [],
-            'actions': [],
-            'rewards': [],
-            'values': [],
-            'log_probs': []
+        # Combined model for training
+        self.setup_combined_model()
+
+    def get_config(self):
+        """Return the configuration of the model for serialization."""
+        return {
+            "latent_dim": self.latent_dim,
+            "keys": self.keys,
+            "vocab_size": self.vocab_size,
+            "max_length": self.max_length,
+            "lat_centroid": self.lat_centroid,
+            "lon_centroid": self.lon_centroid,
+            "scale_factor": self.scale_factor,
+            "gamma": self.gamma,
+            "gae_lambda": self.gae_lambda,
+            "clip_epsilon": self.clip_epsilon,
+            "c1": self.c1,
+            "c2": self.c2,
         }
-    
-    def build_actor_critic(self):
-        """Build actor (policy) and critic (value) networks with proper policy distribution outputs."""
-        # Common inputs for both actor and critic
+        
+    @classmethod
+    def from_config(cls, config):
+        """Create a model from its config."""
+        return cls(**config)
+
+    @classmethod
+    def from_saved_checkpoint(cls, epoch, checkpoint_dir='results'):
+        """Load a model from saved checkpoints.
+        
+        Args:
+            epoch: The epoch number of the checkpoint to load
+            checkpoint_dir: Directory where checkpoints are saved
+            
+        Returns:
+            An instance of the model with loaded weights
+        """
+        # Load model config
+        try:
+            with open(f'{checkpoint_dir}/model_config_{epoch}.json', 'r') as f:
+                config = json.load(f)
+            
+            # Create model instance
+            model = cls(**config)
+            
+            # Try to load saved weights
+            model.generator.load_weights(f'{checkpoint_dir}/generator_{epoch}.weights.h5')
+            model.discriminator.load_weights(f'{checkpoint_dir}/discriminator_{epoch}.weights.h5')
+            model.critic.load_weights(f'{checkpoint_dir}/critic_{epoch}.weights.h5')
+            
+            print(f"Successfully loaded model from epoch {epoch}")
+            return model
+            
+        except Exception as e:
+            print(f"Error loading model from checkpoint: {e}")
+            raise
+
+    def build_generator(self):
+        # Input Layer
         inputs = []
         embeddings = []
         
-        # Create input layers
+        # Noise input
+        noise = Input(shape=(self.latent_dim,), name='input_noise')
         mask = Input(shape=(self.max_length, 1), name='input_mask')
         
+        # Embedding layers for each feature
         for idx, key in enumerate(self.keys):
             if key == 'mask':
                 inputs.append(mask)
                 continue
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
-                e = TimeDistributed(Dense(64, activation='relu', kernel_initializer=he_uniform(seed=1)))(i)
+                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
+                dense_latlon = [d(x) for x in unstacked]
+                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
-                e = TimeDistributed(Dense(self.vocab_size[key], activation='relu', kernel_initializer=he_uniform(seed=1)))(i)
-                
+                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
+                dense_attr = [d(x) for x in unstacked]
+                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
             inputs.append(i)
             embeddings.append(e)
-            
-        # Add noise input for the actor only
-        noise = Input(shape=(self.latent_dim,), name='input_noise')
+        
+        # Add noise input to the inputs list
         inputs.append(noise)
         
-        # Concatenate embeddings
-        concat_embeddings = Concatenate(axis=2)(embeddings)
+        # Add noise embedding
+        noise_repeated = Lambda(lambda x: tf.tile(tf.expand_dims(x, 1), [1, self.max_length, 1]))(noise)
+        embeddings.append(noise_repeated)
         
-        # Project to transformer dimension
-        x = TimeDistributed(Dense(self.head_size * self.num_heads, 
-                                 use_bias=True, 
-                                 activation='relu', 
-                                 kernel_initializer=he_uniform(seed=1)))(concat_embeddings)
+        # Feature Fusion Layer
+        concat_input = Concatenate(axis=2)(embeddings)
         
-        # Add positional encoding
-        pos_encoding = Lambda(
-            lambda x: x + positional_encoding(self.max_length, self.head_size * self.num_heads),
-            output_shape=(self.max_length, self.head_size * self.num_heads)
-        )(x)
+        # Project concatenated embeddings to correct dimension
+        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
         
-        # Add noise to every position using custom layer
-        expanded_noise = ExpandNoise(self.max_length)(noise)
+        # Transformer blocks
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
         
-        # Concatenate noise to features for actor
-        x_with_noise = Concatenate(axis=2)([pos_encoding, expanded_noise])
-        x_with_noise = Dense(self.head_size * self.num_heads, activation='relu')(x_with_noise)
+        # Output layers
+        outputs = []
+        for idx, key in enumerate(self.keys):
+            if key == 'mask':
+                output_mask = Lambda(lambda x: x)(mask)
+                outputs.append(output_mask)
+            elif key == 'lat_lon':
+                output = TimeDistributed(Dense(2, activation='tanh'), name='output_latlon')(x)
+                scale_factor = self.scale_factor
+                output_stratched = Lambda(lambda x: x * scale_factor)(output)
+                outputs.append(output_stratched)
+            else:
+                output = TimeDistributed(Dense(self.vocab_size[key], activation='softmax'), 
+                                       name='output_' + key)(x)
+                outputs.append(output)
         
-        # Apply transformer blocks
-        transformer_output = x_with_noise
-        for _ in range(self.transformer_blocks):
-            transformer_output = transformer_encoder_block(
-                transformer_output, 
-                head_size=self.head_size,
-                num_heads=self.num_heads,
-                ff_dim=self.ff_dim,
-                dropout=self.dropout_rate
-            )
-        
-        # Actor outputs (policy distributions)
-        # For lat_lon: use Gaussian distribution (mean and log std)
-        latlon_mean = TimeDistributed(Dense(2, activation='tanh'), name='latlon_mean')(transformer_output)
-        latlon_mean_scaled = Lambda(
-            lambda x: x * self.scale_factor,
-            output_shape=(self.max_length, 2)
-        )(latlon_mean)
-        
-        # Log std dev for each lat/lon coordinate (initialized to small negative value)
-        latlon_logstd = TimeDistributed(Dense(2, activation='linear', 
-                                           kernel_initializer=tf.keras.initializers.Constant(-1.0)), 
-                                       name='latlon_logstd')(transformer_output)
-        
-        # For categorical outputs: use softmax distributions
-        day_logits = TimeDistributed(Dense(self.vocab_size['day']), name='day_logits')(transformer_output)
-        day_probs = TimeDistributed(Dense(self.vocab_size['day'], activation='softmax'), 
-                                   name='day_probs')(day_logits)
-        
-        hour_logits = TimeDistributed(Dense(self.vocab_size['hour']), name='hour_logits')(transformer_output)
-        hour_probs = TimeDistributed(Dense(self.vocab_size['hour'], activation='softmax'), 
-                                    name='hour_probs')(hour_logits)
-        
-        category_logits = TimeDistributed(Dense(self.vocab_size['category']), name='category_logits')(transformer_output)
-        category_probs = TimeDistributed(Dense(self.vocab_size['category'], activation='softmax'), 
-                                        name='category_probs')(category_logits)
-        
-        # Add mask output (pass through)
-        mask_output = Lambda(lambda x: x, name='mask_output')(mask)
-        
-        # Actor model with multiple outputs
-        actor_model = Model(
-            inputs=inputs, 
-            outputs=[latlon_mean_scaled, latlon_logstd, day_probs, hour_probs, category_probs, mask_output],
-            name='actor'
-        )
-        
-        # Critic model without noise input and with only value output
-        # Create a separate set of inputs for critic
-        critic_inputs = inputs[:-1]  # All inputs except noise
-        critic_embeddings = embeddings
-        
-        # Process inputs with transformer
-        critic_concat = Concatenate(axis=2)(critic_embeddings)
-        critic_projected = TimeDistributed(Dense(self.head_size * self.num_heads,
-                                               use_bias=True,
-                                               activation='relu'))(critic_concat)
-        
-        critic_pos_encoding = Lambda(
-            lambda x: x + positional_encoding(self.max_length, self.head_size * self.num_heads)
-        )(critic_projected)
-        
-        # Apply transformer blocks
-        critic_transformer = critic_pos_encoding
-        for _ in range(self.transformer_blocks):
-            critic_transformer = transformer_encoder_block(
-                critic_transformer,
-                head_size=self.head_size,
-                num_heads=self.num_heads,
-                ff_dim=self.ff_dim,
-                dropout=self.dropout_rate
-            )
-        
-        # Global pooling for value output
-        critic_pooled = GlobalAveragePooling1D()(critic_transformer)
-        value_output = Dense(1, activation='linear', name='value')(critic_pooled)
-        
-        # Critic model
-        critic_model = Model(inputs=critic_inputs, outputs=value_output, name='critic')
-        
-        return actor_model, critic_model
-    
-    def build_discriminator(self):
-        """Build the trajectory discriminator model using transformer architecture."""
+        return Model(inputs=inputs, outputs=outputs)
+
+    def build_critic(self):
         # Input Layer
         inputs = []
-        
-        # Embedding Layer
         embeddings = []
+        
         for idx, key in enumerate(self.keys):
             if key == 'mask':
                 continue
-            if key == 'lat_lon':
-                i = Input(shape=(self.max_length, self.vocab_size[key]),
-                          name='input_disc_' + key)
-
-                # Dense embedding instead of unstacking
-                e = TimeDistributed(Dense(64, activation='relu', kernel_initializer=he_uniform(seed=1)))(i)
-
+            elif key == 'lat_lon':
+                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
+                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
+                dense_latlon = [d(x) for x in unstacked]
+                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
             else:
-                i = Input(shape=(self.max_length,self.vocab_size[key]), name='input_disc_' + key)
-                e = TimeDistributed(Dense(self.vocab_size[key], activation='relu', kernel_initializer=he_uniform(seed=1)))(i)
-                
+                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
+                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
+                dense_attr = [d(x) for x in unstacked]
+                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
             inputs.append(i)
             embeddings.append(e)
-            
-        # Concatenate embeddings
-        concat_embeddings = Concatenate(axis=2)(embeddings)
         
-        # Project to transformer dimension
-        x = TimeDistributed(Dense(self.head_size * self.num_heads, 
-                                 use_bias=True, 
-                                 activation='relu', 
-                                 kernel_initializer=he_uniform(seed=1)))(concat_embeddings)
+        # Feature Fusion Layer
+        concat_input = Concatenate(axis=2)(embeddings)
         
-        # Add positional encoding
-        pos_encoding = Lambda(
-            lambda x: x + positional_encoding(self.max_length, self.head_size * self.num_heads),
-            output_shape=(self.max_length, self.head_size * self.num_heads)
-        )(x)
+        # Project concatenated embeddings to correct dimension
+        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
         
-        # Apply transformer blocks
-        transformer_output = pos_encoding
-        for _ in range(self.transformer_blocks):
-            transformer_output = transformer_encoder_block(
-                transformer_output, 
-                head_size=self.head_size,
-                num_heads=self.num_heads,
-                ff_dim=self.ff_dim,
-                dropout=self.dropout_rate
-            )
+        # Transformer blocks
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
         
         # Global average pooling
-        pooled = GlobalAveragePooling1D()(transformer_output)
+        x = tf.keras.layers.GlobalAveragePooling1D()(x)
+        
+        # Value head
+        value = Dense(1)(x)
+        
+        return Model(inputs=inputs, outputs=value)
+
+    def build_discriminator(self):
+        # Similar to original discriminator but with Transformer blocks
+        inputs = []
+        embeddings = []
+        
+        for idx, key in enumerate(self.keys):
+            if key == 'mask':
+                continue
+            elif key == 'lat_lon':
+                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
+                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
+                dense_latlon = [d(x) for x in unstacked]
+                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
+            else:
+                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
+                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
+                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
+                dense_attr = [d(x) for x in unstacked]
+                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
+            inputs.append(i)
+            embeddings.append(e)
+        
+        # Feature Fusion Layer
+        concat_input = Concatenate(axis=2)(embeddings)
+        
+        # Project concatenated embeddings to correct dimension
+        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
+        
+        # Transformer blocks
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
+        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
+        
+        # Global average pooling
+        x = tf.keras.layers.GlobalAveragePooling1D()(x)
         
         # Output
-        sigmoid = Dense(1, activation='sigmoid', name='discriminator_output')(pooled)
+        sigmoid = Dense(1, activation='sigmoid')(x)
+        
+        return Model(inputs=inputs, outputs=sigmoid)
 
-        return Model(inputs=inputs, outputs=sigmoid, name='discriminator')
-    
-    def build_tul_model(self):
-        """Build the Trajectory-User Linking model to evaluate privacy."""
-        # Input layers
-        input_lat_lon = Input(shape=(self.max_length, 2), name='input_tul_lat_lon')
-        input_day = Input(shape=(self.max_length, self.vocab_size['day']), name='input_tul_day')
-        input_hour = Input(shape=(self.max_length, self.vocab_size['hour']), name='input_tul_hour')
-        input_category = Input(shape=(self.max_length, self.vocab_size['category']), name='input_tul_category')
+    def setup_combined_model(self):
+        # Generator inputs
+        inputs = []
+        mask = Input(shape=(self.max_length, 1), name='input_mask')
+        noise = Input(shape=(self.latent_dim,), name='input_noise')
         
-        # Process inputs
-        processed_lat_lon = TimeDistributed(Dense(100))(input_lat_lon)
-        processed_day = TimeDistributed(Dense(100))(input_day)
-        processed_hour = TimeDistributed(Dense(100))(input_hour)
-        processed_category = TimeDistributed(Dense(100))(input_category)
+        # Create inputs in the same order as build_generator
+        for idx, key in enumerate(self.keys):
+            if key == 'mask':
+                inputs.append(mask)
+                continue
+            i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
+            inputs.append(i)
         
-        # Concatenate processed inputs
-        concat = Concatenate(axis=2)([processed_lat_lon, processed_day, processed_hour, processed_category])
+        # Add noise as the last input (to match the generator's input order)
+        inputs.append(noise)
         
-        # Dropout and LSTM
-        dropout1 = Dropout(0.5)(concat)
-        lstm = LSTM(units=50, recurrent_regularizer=l1(0.02))(dropout1)
+        # Generate trajectories
+        gen_trajs = self.generator(inputs)
         
-        # Final dropout and output layer
-        dropout2 = Dropout(0.5)(lstm)
+        # Discriminator predictions
+        pred = self.discriminator(gen_trajs[:4])
         
-        # Assume num_users is 193 based on previous code
-        num_users = 193
-        output = Dense(units=num_users, kernel_initializer=he_uniform(), activation='softmax', name='tul_output')(dropout2)
+        # Create the combined model
+        self.combined = Model(inputs, pred)
         
-        # Create model
-        model = Model(inputs=[input_lat_lon, input_day, input_hour, input_category], 
-                     outputs=output,
-                     name='tul_model')
+        # Create a custom loss instance for trajectory optimization
+        self.traj_loss = CustomTrajLoss()
+        # Store input and generator output references
+        self.input_tensors = inputs
+        self.generated_trajectories = gen_trajs
         
-        return model
-    
-    # Fix for the sample_actions method in RL_Transformer_TrajGAN_Fixed.py
+        # Compile the model with the custom loss
+        self.combined.compile(loss=self.traj_loss, optimizer=self.actor_optimizer)
+        
+        # Store the generator outputs for later use in reward computation
+        self.gen_trajs_symbolic = gen_trajs
 
-    def sample_actions(self, actor_outputs, deterministic=False):
-        """Sample actions from policy distributions."""
-        # Unpack actor outputs
-        latlon_mean, latlon_logstd, day_probs, hour_probs, category_probs, mask = actor_outputs
-        batch_size = tf.shape(latlon_mean)[0]
+    def compute_rewards(self, real_trajs, gen_trajs, tul_classifier):
+        """Compute the three-part reward function as described in the paper.
         
-        # Apply the mask to prioritize valid timesteps - make sure dimensions match
-        valid_mask = tf.cast(mask > 0, tf.float32)
+        Args:
+            real_trajs: Original real trajectories
+            gen_trajs: Generated synthetic trajectories
+            tul_classifier: Pre-trained TUL classifier for privacy evaluation
         
-        # Sample lat_lon from Gaussian
-        if deterministic:
-            latlon_actions = latlon_mean
-        else:
-            latlon_std = tf.exp(latlon_logstd)
-            epsilon = tf.random.normal(tf.shape(latlon_mean))
-            latlon_actions = latlon_mean + epsilon * latlon_std
+        Returns:
+            Combined reward balancing privacy, utility and realism
+        """
+        # Cast inputs to float32 for consistent typing
+        gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
+        real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
         
-        # Apply mask to latlon - shape should be [batch_size, max_length, 2]
-        latlon_actions = latlon_actions * tf.cast(tf.reshape(valid_mask, [batch_size, self.max_length, 1]), tf.float32)
+        # Adversarial reward - measures realism based on discriminator output
+        d_pred = self.discriminator.predict(gen_trajs[:4])
+        d_pred = tf.cast(d_pred, tf.float32)
+        # Clip discriminator predictions to avoid extreme log values
+        d_pred = tf.clip_by_value(d_pred, 1e-7, 1.0 - 1e-7)
+        r_adv = tf.math.log(d_pred)
         
-        # Sample categorical actions
-        if deterministic:
-            day_actions = tf.one_hot(tf.argmax(day_probs, axis=-1), depth=self.vocab_size['day'])
-            hour_actions = tf.one_hot(tf.argmax(hour_probs, axis=-1), depth=self.vocab_size['hour'])
-            category_actions = tf.one_hot(tf.argmax(category_probs, axis=-1), depth=self.vocab_size['category'])
-        else:
-            # Reshape for categorical sampling
-            day_flat = tf.reshape(day_probs, [-1, self.vocab_size['day']])
-            hour_flat = tf.reshape(hour_probs, [-1, self.vocab_size['hour']])
-            category_flat = tf.reshape(category_probs, [-1, self.vocab_size['category']])
+        # Utility preservation reward - measures statistical similarity
+        # Spatial loss - L2 distance between coordinates
+        spatial_loss = tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]), axis=[1, 2])
+        spatial_loss = tf.cast(spatial_loss, tf.float32)
+        # Clip spatial loss to avoid extremely large values
+        spatial_loss = tf.clip_by_value(spatial_loss, 0.0, 10.0)
+        
+        # Temporal loss - cross-entropy on temporal distributions (day and hour)
+        # Clip generated values to avoid log(0)
+        gen_trajs_day_clipped = tf.clip_by_value(gen_trajs[2], 1e-7, 1.0 - 1e-7)
+        temp_day_loss = -tf.reduce_sum(real_trajs[2] * tf.math.log(gen_trajs_day_clipped), axis=[1, 2])
+        temp_day_loss = tf.cast(temp_day_loss, tf.float32)
+        temp_day_loss = tf.clip_by_value(temp_day_loss, 0.0, 10.0)
+        
+        gen_trajs_hour_clipped = tf.clip_by_value(gen_trajs[3], 1e-7, 1.0 - 1e-7)
+        temp_hour_loss = -tf.reduce_sum(real_trajs[3] * tf.math.log(gen_trajs_hour_clipped), axis=[1, 2])
+        temp_hour_loss = tf.cast(temp_hour_loss, tf.float32)
+        temp_hour_loss = tf.clip_by_value(temp_hour_loss, 0.0, 10.0)
+        
+        # Categorical loss - cross-entropy on category distributions
+        gen_trajs_cat_clipped = tf.clip_by_value(gen_trajs[1], 1e-7, 1.0 - 1e-7)
+        cat_loss = -tf.reduce_sum(real_trajs[1] * tf.math.log(gen_trajs_cat_clipped), axis=[1, 2])
+        cat_loss = tf.cast(cat_loss, tf.float32)
+        cat_loss = tf.clip_by_value(cat_loss, 0.0, 10.0)
+        
+        # Combine utility components with appropriate weights
+        # Convert Python floats to TensorFlow constants with explicit type
+        beta = tf.constant(1.0, dtype=tf.float32)
+        gamma = tf.constant(0.5, dtype=tf.float32)  # Renamed to avoid clash with class attribute
+        chi = tf.constant(0.5, dtype=tf.float32)
+        
+        r_util = -(beta * spatial_loss + gamma * (temp_day_loss + temp_hour_loss) + chi * cat_loss)
+        
+        # Privacy preservation reward using TUL classifier
+        # Adapt input format for MARC model which expects different dimensions
+        try:
+            batch_size = gen_trajs[0].shape[0]
             
-            # Sample from categorical distributions
-            day_indices = tf.random.categorical(tf.math.log(day_flat + 1e-10), 1)
-            hour_indices = tf.random.categorical(tf.math.log(hour_flat + 1e-10), 1)
-            category_indices = tf.random.categorical(tf.math.log(category_flat + 1e-10), 1)
+            # Format inputs for MARC model:
+            # 1. Convert one-hot to indices for day, hour, category
+            # Note: gen_trajs order is [lat_lon, category, day, hour, mask]
             
-            # Reshape back to batch form
-            day_indices = tf.reshape(day_indices, [batch_size, self.max_length])
-            hour_indices = tf.reshape(hour_indices, [batch_size, self.max_length])
-            category_indices = tf.reshape(category_indices, [batch_size, self.max_length])
+            # Convert one-hot day to indices (batch_size, 144) where each value is 0-6
+            day_indices = tf.cast(tf.argmax(gen_trajs[2], axis=-1), tf.int32)
+            # Clip day values to ensure they're in the valid range [0, 6]
+            day_indices = tf.clip_by_value(day_indices, 0, 6)
             
-            # Convert to one-hot
-            day_actions = tf.one_hot(day_indices, depth=self.vocab_size['day'])
-            hour_actions = tf.one_hot(hour_indices, depth=self.vocab_size['hour'])
-            category_actions = tf.one_hot(category_indices, depth=self.vocab_size['category'])
+            # Convert one-hot hour to indices (batch_size, 144) where each value is 0-23
+            hour_indices = tf.cast(tf.argmax(gen_trajs[3], axis=-1), tf.int32)
+            # Clip hour values to ensure they're in the valid range [0, 23]
+            hour_indices = tf.clip_by_value(hour_indices, 0, 23)
+            
+            # Convert one-hot category to indices (batch_size, 144) where each value is 0-9
+            category_indices = tf.cast(tf.argmax(gen_trajs[1], axis=-1), tf.int32)
+            # Clip category values to ensure they're in valid range [0, 9]
+            category_indices = tf.clip_by_value(category_indices, 0, 9)
+            
+            # Format lat_lon to match MARC's expected input shape (batch_size, 144, 40)
+            # Since our lat_lon is (batch_size, 144, 2), we'll pad it to 40 dimensions
+            lat_lon_padded = tf.pad(gen_trajs[0], [[0, 0], [0, 0], [0, 38]])
+            
+            print(f"Input shapes - Day: {day_indices.shape}, Hour: {hour_indices.shape}, " +
+                  f"Category: {category_indices.shape}, Lat_lon: {lat_lon_padded.shape}")
+            print(f"Day range: [{tf.reduce_min(day_indices)}, {tf.reduce_max(day_indices)}]")
+            
+            # Call the MARC model with the correctly formatted inputs
+            tul_preds = tul_classifier([day_indices, hour_indices, category_indices, lat_lon_padded])
+            
+            # Extract the probability for the correct user
+            # Get the number of output classes from the TUL model
+            num_users = tul_preds.shape[1]
+            print(f"TUL predictions shape: {tul_preds.shape}")
+            
+            # Generate user indices but make sure they don't exceed the valid range
+            user_indices = np.arange(batch_size) % num_users
+            
+            # Safely gather user probabilities
+            batch_indices = tf.range(batch_size, dtype=tf.int32)
+            indices = tf.stack([batch_indices, tf.cast(user_indices, tf.int32)], axis=1)
+            user_probs = tf.gather_nd(tul_preds, indices)
+            
+            # Negative reward for correct user identification (penalize high probabilities)
+            alpha = tf.constant(1.0, dtype=tf.float32)  # Privacy weight
+            r_priv = -alpha * tf.cast(user_probs, tf.float32)
+            
+        except Exception as e:
+            print(f"Error computing privacy reward: {e}")
+            import traceback
+            traceback.print_exc()
+            print("Using a placeholder privacy reward instead")
+            # If there's an error with the TUL model, use a placeholder privacy reward
+            r_priv = tf.zeros_like(r_adv)
         
-        # Apply mask correctly - reshape valid_mask to match required dimensions
-        # The issue is in this section: the valid_mask shape is [batch_size, max_length, 1]
-        # but we need it as [batch_size, max_length, 1] for broadcasting with one-hot encodings
-        reshaped_mask = tf.reshape(valid_mask, [batch_size, self.max_length, 1])
+        # Combined reward with configurable weights
+        w1 = tf.constant(0.5, dtype=tf.float32)  # Reduced weight for adversarial reward
+        w2 = tf.constant(0.3, dtype=tf.float32)  # Reduced weight for utility reward
+        w3 = tf.constant(0.2, dtype=tf.float32)  # Reduced weight for privacy reward
         
-        # Now apply mask to categorical actions
-        day_actions = day_actions * tf.cast(reshaped_mask, tf.float32)
-        hour_actions = hour_actions * tf.cast(reshaped_mask, tf.float32)
-        category_actions = category_actions * tf.cast(reshaped_mask, tf.float32)
+        r_adv = tf.cast(r_adv, tf.float32)
         
-        return [latlon_actions, day_actions, hour_actions, category_actions, mask]
-    
-    # Fix for the compute_log_probs method in RL_Transformer_TrajGAN_Fixed.py
+        # Ensure r_adv, r_util, and r_priv have appropriate shapes
+        r_adv = tf.reshape(r_adv, [-1])
+        r_util = tf.reshape(r_util, [-1])
+        r_priv = tf.reshape(r_priv, [-1])
+        
+        # Compute the combined reward
+        combined_rewards = w1 * r_adv + w2 * r_util + w3 * r_priv
+        
+        # Ensure the rewards have shape [batch_size, 1]
+        rewards = tf.reshape(combined_rewards, [batch_size, 1])
+        
+        # Normalize rewards for training stability
+        rewards_mean = tf.reduce_mean(rewards)
+        rewards_std = tf.math.reduce_std(rewards) + 1e-8
+        rewards = (rewards - rewards_mean) / rewards_std
+        
+        # Clip rewards to reasonable range to prevent training instability
+        rewards = tf.clip_by_value(rewards, -5.0, 5.0)
+        
+        # Debug print to check rewards shape and values
+        print(f"Rewards shape: {rewards.shape}, min: {tf.reduce_min(rewards)}, max: {tf.reduce_max(rewards)}, mean: {tf.reduce_mean(rewards)}")
+        
+        return rewards
 
-    # Fix for the shape assertion in compute_log_probs method
-
-    def compute_log_probs(self, actions, actor_outputs):
-        """Compute log probabilities of actions under current policy."""
-        latlon_actions, day_actions, hour_actions, category_actions, mask = actions
-        latlon_mean, latlon_logstd, day_probs, hour_probs, category_probs, _ = actor_outputs
+    def train_step(self, real_trajs, batch_size=256):
+        # Generate trajectories
+        noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+        gen_trajs = self.generator.predict([*real_trajs, noise])
         
-        # Get batch size and sequence length
-        batch_size = tf.shape(latlon_actions)[0]
-        sequence_length = tf.shape(latlon_actions)[1]
+        # Ensure consistent data types
+        real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
+        gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
         
-        # Get valid mask
-        valid_mask = tf.cast(mask > 0, tf.float32)
+        # Update the custom loss with the current real and generated trajectories
+        self.traj_loss.set_trajectories(real_trajs, gen_trajs)
         
-        # Compute log prob for Gaussian (lat_lon)
-        latlon_std = tf.exp(latlon_logstd)
-        log_prob_gaussian = -0.5 * (
-            tf.math.log(2.0 * np.pi) + 
-            2.0 * latlon_logstd + 
-            ((latlon_actions - latlon_mean) / latlon_std) ** 2
+        # Compute full rewards using the TUL classifier
+        rewards = self.compute_rewards(real_trajs, gen_trajs, self.tul_classifier)
+        
+        # Compute advantages and returns for PPO
+        values = self.critic.predict(real_trajs[:4])
+        values = tf.cast(values, tf.float32)
+        advantages = compute_advantage(rewards, values, self.gamma, self.gae_lambda)
+        returns = compute_returns(rewards, self.gamma)
+        
+        # Ensure returns has the same batch size as what the critic expects
+        # The critic takes real_trajs[:4] as input, so returns should match that shape
+        if returns.shape[0] != batch_size:
+            print(f"Warning: Reshaping returns from {returns.shape} to [{batch_size}, 1]")
+            returns = tf.reshape(returns, [batch_size, 1])
+        
+        # Update critic using returns
+        c_loss = self.critic.train_on_batch(real_trajs[:4], returns)
+        
+        # Update discriminator
+        d_loss_real = self.discriminator.train_on_batch(
+            real_trajs[:4],
+            np.ones((batch_size, 1))
+        )
+        d_loss_fake = self.discriminator.train_on_batch(
+            gen_trajs[:4],
+            np.zeros((batch_size, 1))
         )
         
-        # Sum across lat/lon dimensions
-        log_prob_latlon = tf.reduce_sum(log_prob_gaussian, axis=-1)  # Sum across lat/lon dims
+        # Update generator (actor) using advantages
+        g_loss = self.update_actor(real_trajs, gen_trajs, advantages)
         
-        # Compute log probs for categorical distributions
-        # For day actions
-        log_day_probs = tf.reduce_sum(day_actions * tf.math.log(day_probs + 1e-10), axis=-1)
+        return {"d_loss_real": d_loss_real, "d_loss_fake": d_loss_fake, "g_loss": g_loss, "c_loss": c_loss}
+
+    def train(self, epochs=200, batch_size=256, sample_interval=10):
+        # Training data
+        x_train = np.load('data/final_train.npy', allow_pickle=True)
+        self.x_train = x_train
         
-        # For hour actions
-        log_hour_probs = tf.reduce_sum(hour_actions * tf.math.log(hour_probs + 1e-10), axis=-1)
+        # Padding
+        X_train = [pad_sequences(f, self.max_length, padding='pre', dtype='float64') 
+                  for f in x_train]
+        self.X_train = X_train
         
-        # For category actions
-        log_category_probs = tf.reduce_sum(category_actions * tf.math.log(category_probs + 1e-10), axis=-1)
+        # Check if we need to rebuild the model with correct input shapes
+        needs_rebuild = False
+        actual_shapes = {}
         
-        # Combine log probs for each timestep
-        per_timestep_log_probs = log_prob_latlon + log_day_probs + log_hour_probs + log_category_probs
+        for i, key in enumerate(self.keys):
+            if key != 'mask':
+                actual_shape = X_train[i].shape
+                print(f"Data shape for {key}: {actual_shape}")
+                if key == 'category' and actual_shape[2] != self.vocab_size[key]:
+                    print(f"Mismatch for {key}: expected {self.vocab_size[key]}, got {actual_shape[2]}")
+                    self.vocab_size[key] = actual_shape[2]
+                    needs_rebuild = True
+                actual_shapes[key] = actual_shape[2]
         
-        # Apply mask to only consider valid timesteps - make sure the shapes match
-        # Instead of using shape assertion which is causing problems, print shapes for debugging
-        # and ensure mask has correct shape
-        
-        # Ensure valid_mask has same shape as per_timestep_log_probs
-        # Both should be [batch_size, sequence_length]
-        valid_mask_reshaped = tf.reshape(valid_mask, tf.shape(per_timestep_log_probs))
-        
-        # Now use the reshaped mask
-        masked_log_probs = per_timestep_log_probs * valid_mask_reshaped
-        
-        # Sum across timesteps and normalize by valid timesteps count
-        valid_timesteps = tf.reduce_sum(valid_mask_reshaped, axis=1)
-        trajectory_log_probs = tf.reduce_sum(masked_log_probs, axis=1) / (valid_timesteps + 1e-10)
-        
-        return trajectory_log_probs
-    
-    def compute_entropy(self, actor_outputs):
-        """Compute entropy of the policy for exploration."""
-        _, latlon_logstd, day_probs, hour_probs, category_probs, mask = actor_outputs
-        
-        # Get valid mask
-        valid_mask = tf.cast(mask > 0, tf.float32)
-        
-        # Entropy of Gaussian is 0.5 * log(2*pi*e*sigma^2)
-        latlon_std = tf.exp(latlon_logstd)
-        gaussian_entropy = 0.5 * tf.math.log(2.0 * np.pi * np.e) + latlon_logstd
-        gaussian_entropy = tf.reduce_sum(gaussian_entropy, axis=-1)  # Sum across lat/lon dims
-        
-        # Entropy of categorical distributions: -sum(p * log(p))
-        day_entropy = -tf.reduce_sum(day_probs * tf.math.log(day_probs + 1e-10), axis=-1)
-        hour_entropy = -tf.reduce_sum(hour_probs * tf.math.log(hour_probs + 1e-10), axis=-1)
-        category_entropy = -tf.reduce_sum(category_probs * tf.math.log(category_probs + 1e-10), axis=-1)
-        
-        # Combine entropies for each timestep
-        per_timestep_entropy = gaussian_entropy + day_entropy + hour_entropy + category_entropy
-        
-        # Reshape valid_mask to match per_timestep_entropy
-        valid_mask_reshaped = tf.reshape(valid_mask, tf.shape(per_timestep_entropy))
-        
-        # Apply mask
-        masked_entropy = per_timestep_entropy * valid_mask_reshaped
-        
-        # Average across valid timesteps
-        batch_size = tf.shape(day_probs)[0]
-        sequence_length = tf.shape(day_probs)[1]
-        
-        # Sum across timesteps and normalize by valid timesteps count
-        valid_timesteps = tf.reduce_sum(valid_mask_reshaped, axis=1)
-        avg_entropy = tf.reduce_sum(masked_entropy, axis=1) / (valid_timesteps + 1e-10)
-        
-        return avg_entropy
-    
-    def compute_gae(self, rewards, values, next_values=None, gamma=0.99, lam=0.95, use_mask=None):
-        """Compute Generalized Advantage Estimation."""
-        batch_size = len(rewards)
-        advantages = np.zeros_like(rewards)
-        
-        for i in range(batch_size):
-            # If mask provided, only consider valid timesteps
-            if use_mask is not None:
-                valid_indices = np.where(use_mask[i] > 0)[0]
-                if len(valid_indices) == 0:
-                    continue
-                
-                # Extract only valid timesteps
-                batch_rewards = rewards[i][valid_indices]
-                batch_values = values[i][valid_indices]
-                
-                if next_values is not None:
-                    batch_next_values = next_values[i][valid_indices]
-                else:
-                    # Append a 0 as the next value of the last timestep
-                    batch_next_values = np.append(batch_values[1:], 0)
-            else:
-                batch_rewards = rewards[i]
-                batch_values = values[i]
-                
-                if next_values is not None:
-                    batch_next_values = next_values[i]
-                else:
-                    # Append a 0 as the next value of the last timestep
-                    batch_next_values = np.append(batch_values[1:], 0)
+        # Rebuild the model if needed
+        if needs_rebuild:
+            print("Rebuilding model with correct input shapes...")
+            # Save optimizer state
+            optimizer_weights = None
+            if hasattr(self, 'actor_optimizer') and hasattr(self.actor_optimizer, 'get_weights'):
+                optimizer_weights = self.actor_optimizer.get_weights()
             
-            # Calculate TD errors: δt = rt + γ*V(s_{t+1}) - V(s_t)
-            deltas = batch_rewards + gamma * batch_next_values - batch_values
+            # Rebuild models
+            self.generator = self.build_generator()
+            self.critic = self.build_critic()
+            self.discriminator = self.build_discriminator()
             
-            # Compute GAE-λ advantage
-            last_gae = 0
-            for t in reversed(range(len(batch_rewards))):
-                last_gae = deltas[t] + gamma * lam * last_gae
-                
-                if use_mask is not None:
-                    advantages[i][valid_indices[t]] = last_gae
-                else:
-                    advantages[i][t] = last_gae
-        
-        return advantages
-    
-    def compute_rewards(self, real_trajs, gen_trajs, user_ids):
-        """Compute rewards based on privacy, utility, and realism."""
-        batch_size = len(real_trajs[0])
-        
-        # Unpack trajectories
-        real_latlon, real_day, real_hour, real_category, real_mask = real_trajs
-        gen_latlon, gen_day, gen_hour, gen_category, gen_mask = gen_trajs
-        
-        # Get valid mask - convert to numpy for processing
-        valid_mask = np.array(real_mask > 0, dtype=np.float32)
-        
-        # Convert tensors to numpy arrays for non-TF operations
-        gen_latlon_np = gen_latlon.numpy() if hasattr(gen_latlon, 'numpy') else gen_latlon
-        gen_day_np = gen_day.numpy() if hasattr(gen_day, 'numpy') else gen_day
-        gen_hour_np = gen_hour.numpy() if hasattr(gen_hour, 'numpy') else gen_hour
-        gen_category_np = gen_category.numpy() if hasattr(gen_category, 'numpy') else gen_category
-        
-        # 1. Evaluate privacy using TUL model
-        tul_inputs = [gen_latlon_np, gen_day_np, gen_hour_np, gen_category_np]
-        tul_outputs = self.tul_model.predict(tul_inputs)
-        
-        # Calculate privacy rewards
-        privacy_rewards = np.zeros((batch_size,))
-        for i in range(batch_size):
-            user_id = user_ids[i] % tul_outputs.shape[1]  # Ensure valid user_id
-            p_user = tul_outputs[i, user_id]
-            # Higher reward for lower identification probability
-            privacy_rewards[i] = -np.log(p_user + 1e-10)
-        
-        # 2. Calculate utility rewards (spatial and semantic similarity)
-        utility_rewards = np.zeros((batch_size,))
-        for i in range(batch_size):
-            mask_i = valid_mask[i].reshape(-1)
-            valid_indices = np.where(mask_i > 0)[0]
+            # Compile models
+            self.discriminator.compile(loss='binary_crossentropy', optimizer=self.discriminator_optimizer)
+            self.critic.compile(loss='mse', optimizer=self.critic_optimizer)
             
-            if len(valid_indices) > 0:
-                # Spatial distance between real and generated trajectory points
-                real_latlon_i = real_latlon[i][valid_indices]
-                gen_latlon_i = gen_latlon_np[i][valid_indices]
-                
-                spatial_dist = np.mean(np.sqrt(np.sum((real_latlon_i - gen_latlon_i) ** 2, axis=1)))
-                
-                # Semantic similarity for categorical features
-                sem_dist = 0
-                
-                # Day similarity
-                real_day_i = real_day[i][valid_indices]
-                gen_day_i = gen_day_np[i][valid_indices]
-                day_js_div = self._compute_js_divergence(real_day_i, gen_day_i)
-                
-                # Hour similarity
-                real_hour_i = real_hour[i][valid_indices]
-                gen_hour_i = gen_hour_np[i][valid_indices]
-                hour_js_div = self._compute_js_divergence(real_hour_i, gen_hour_i)
-                
-                # Category similarity
-                real_category_i = real_category[i][valid_indices]
-                gen_category_i = gen_category_np[i][valid_indices]
-                category_js_div = self._compute_js_divergence(real_category_i, gen_category_i)
-                
-                # Combine semantic distances
-                sem_dist = (day_js_div + hour_js_div + category_js_div) / 3.0
-                
-                # Total utility reward (negative distance)
-                utility_rewards[i] = -1.0 * (0.7 * spatial_dist + 0.3 * sem_dist)
-            else:
-                utility_rewards[i] = 0.0  # No valid points
+            self.setup_combined_model()
+            
+            # Restore optimizer state if available
+            if optimizer_weights is not None:
+                self.actor_optimizer.set_weights(optimizer_weights)
+            
+            print("Model rebuilt successfully!")
         
-        # 3. Calculate adversarial rewards using discriminator
-        disc_inputs = [gen_latlon_np, gen_day_np, gen_hour_np, gen_category_np]
-        disc_outputs = self.discriminator.predict(disc_inputs)
+        # Training loop
+        print(f"Starting training for {epochs} epochs...")
+        for epoch in range(epochs):
+            # Sample batch
+            idx = np.random.randint(0, len(X_train[0]), batch_size)
+            batch = [X[idx] for X in X_train]
+            
+            # Training step
+            metrics = self.train_step(batch, batch_size)
+            
+            # Print progress
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch}/{epochs}")
+                print(f"D_real: {metrics['d_loss_real']:.4f}, D_fake: {metrics['d_loss_fake']:.4f}, G: {metrics['g_loss']:.4f}, C: {metrics['c_loss']:.4f}")
+            
+            # Save checkpoints
+            if epoch % sample_interval == 0:
+                self.save_checkpoint(epoch)
+
+    def save_checkpoint(self, epoch):
+        # Make sure the results directory exists
+        os.makedirs('results', exist_ok=True)
         
-        # Higher reward for fooling the discriminator
-        adv_rewards = np.log(disc_outputs + 1e-10).flatten()
+        # Save model weights
+        try:
+            self.generator.save_weights(f'results/generator_{epoch}.weights.h5')
+            self.discriminator.save_weights(f'results/discriminator_{epoch}.weights.h5')
+            self.critic.save_weights(f'results/critic_{epoch}.weights.h5')
+            print(f"Model weights saved for epoch {epoch}")
+        except Exception as e:
+            print(f"Warning: Could not save weights for epoch {epoch}: {e}")
         
-        # Combine rewards with weights
-        final_rewards = (
-            self.alpha * privacy_rewards + 
-            self.beta * utility_rewards + 
-            self.gamma * adv_rewards
+        # Now try to save the full models with architecture
+        try:
+            # Save the Keras models
+            self.generator.save(f'results/generator_architecture_{epoch}.keras')
+            self.discriminator.save(f'results/discriminator_architecture_{epoch}.keras')
+            self.critic.save(f'results/critic_architecture_{epoch}.keras')
+            print(f"Model architectures saved for epoch {epoch}")
+            
+            # Also save the main model's configuration
+            with open(f'results/model_config_{epoch}.json', 'w') as f:
+                json.dump(self.get_config(), f, indent=4)
+            
+        except Exception as e:
+            print(f"Warning: Could not save full model architectures for epoch {epoch}: {e}")
+            print("Only weights were saved. You'll need to recreate the model structure to load them.")
+
+    def update_actor(self, states, actions, advantages):
+        """Update generator using a simplified policy gradient approach."""
+        # Get a single batch of data with random noise for the generator
+        batch_size = states[0].shape[0]
+        noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+        
+        # Prepare inputs for the generator
+        all_inputs = [*states, noise]
+        
+        # Use ones as targets for the discriminator output (we want to fool the discriminator)
+        targets = np.ones((batch_size, 1))
+        
+        # Convert advantages to numpy and ensure proper type/shape
+        try:
+            # First ensure advantages is a tensor with float32 type
+            advantages = tf.cast(advantages, tf.float32)
+            
+            # Clip advantages to reasonable range before any other operations
+            advantages = tf.clip_by_value(advantages, -10.0, 10.0)
+            
+            # Then convert to numpy and flatten
+            advantages_np = advantages.numpy().flatten()  # Flatten to ensure it's 1D
+            
+            # Scale advantages to be positive (sample_weight should be positive)
+            advantages_np = advantages_np - np.min(advantages_np) + 1e-3
+            
+            # Normalize to reasonable values (0 to 1 range)
+            if np.max(advantages_np) > 0:
+                advantages_np = advantages_np / np.max(advantages_np)
+                
+            # Ensure it has the right shape
+            if len(advantages_np) != batch_size:
+                print(f"Warning: Reshaping advantages from {len(advantages_np)} to {batch_size}")
+                # If shapes don't match, use uniform weights
+                advantages_np = np.ones(batch_size)
+                
+            # Final safety check - replace any NaN or inf values
+            advantages_np = np.nan_to_num(advantages_np, nan=0.5, posinf=1.0, neginf=0.0)
+                
+        except Exception as e:
+            print(f"Error processing advantages: {e}")
+            # Fallback to uniform weights
+            advantages_np = np.ones(batch_size)
+            
+        # Print statistics about advantage values used for training
+        print(f"Advantage stats - min: {np.min(advantages_np):.4f}, max: {np.max(advantages_np):.4f}, " +
+              f"mean: {np.mean(advantages_np):.4f}, std: {np.std(advantages_np):.4f}")
+        
+        # Train the combined model with sample weights from advantages
+        loss = self.combined.train_on_batch(
+            all_inputs, 
+            targets,
+            sample_weight=advantages_np
         )
         
-        # Return all reward components for monitoring
-        return final_rewards, privacy_rewards, utility_rewards, adv_rewards
+        # If loss is extremely high, clip it for reporting purposes
+        if loss > 10000:  # Arbitrary threshold for "too high" loss
+            print(f"Warning: Loss is very high ({loss:.2f}), consider reducing learning rate manually")
+            loss = min(loss, 10000.0)
         
-    def train_ppo(self, real_trajs, user_ids, ppo_epochs=4, clip_ratio=0.2, target_kl=0.01):
-            """Train the model using PPO algorithm."""
-            batch_size = len(real_trajs[0])
+        return loss
+
+    def compute_trajectory_ratio(self, new_predictions, old_predictions):
+        """Compute the PPO policy ratio between new and old policies for trajectory data.
+        
+        For trajectories, we take the product of point-wise prediction ratios,
+        which is equivalent to the ratio of trajectory probabilities under each policy.
+        """
+        # Initialize ratio as ones
+        ratio = tf.ones(shape=(len(new_predictions[0]), 1))
+        
+        # For each categorical output (category, day, hour), compute ratio
+        for i in range(1, 4):  # Categorical outputs
+            # Get probabilities under new policy
+            new_probs = new_predictions[i]
             
-            # Step 1: Generate trajectories using current policy
-            noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+            # Get probabilities under old policy
+            old_probs = old_predictions[i]
             
-            # Prepare actor inputs
-            actor_inputs = real_trajs + [noise]
+            # Compute the ratio of probabilities (with small epsilon to avoid division by zero)
+            point_ratio = new_probs / (old_probs + 1e-10)
             
-            # Generate policy outputs
-            actor_outputs = self.actor_model.predict(actor_inputs)
+            # Reduce along the category dimension to get per-point ratio
+            point_ratio = tf.reduce_sum(point_ratio, axis=-1, keepdims=True)
             
-            # Sample actions from the policy
-            actions = self.sample_actions(actor_outputs)
+            # Multiply with current ratio
+            ratio = ratio * point_ratio
+        
+        # For continuous outputs (coordinates), use normal distribution likelihood ratio
+        # This is simplified - in practice you'd need proper distribution modeling
+        coord_ratio = tf.exp(-0.5 * tf.reduce_sum(tf.square(new_predictions[0] - old_predictions[0]), axis=-1, keepdims=True))
+        ratio = ratio * coord_ratio
+        
+        # Mask out padding
+        mask = new_predictions[4]
+        ratio = ratio * mask
+        
+        # Average over the trajectory length
+        ratio = tf.reduce_mean(ratio, axis=1)
+        
+        return ratio
+
+    def load_tul_classifier(self):
+        """Load the pre-trained Trajectory-User Linking classifier.
+        
+        Returns:
+            A trained model that predicts user IDs from trajectories.
+        """
+        try:
+            # Import MARC class and initialize it
+            from MARC.marc import MARC
             
-            # Calculate log probabilities of sampled actions
-            old_log_probs = self.compute_log_probs(actions, actor_outputs)
+            # Create and initialize the MARC model
+            marc_model = MARC()
+            marc_model.build_model()
             
-            # Step 2: Evaluate trajectories
-            rewards, privacy_rewards, utility_rewards, adv_rewards = self.compute_rewards(
-                real_trajs, actions, user_ids
+            # Load pre-trained weights
+            marc_model.load_weights('/root/autodl-tmp/location-privacy-main/MARC/MARC_Weight.h5')
+            
+            print("Loaded pre-trained MARC TUL classifier")
+            return marc_model
+            
+        except Exception as e:
+            print(f"Error loading MARC model: {e}")
+            print("Creating a fallback TUL classifier model")
+            
+            # If MARC model loading fails, create a fallback model that matches MARC's input format
+            # MARC expects 4 inputs: day, hour, category (all as indices), and lat_lon (with shape 144,40)
+            
+            # Create input layers with the same names and shapes as MARC
+            input_day = Input(shape=(144,), dtype='int32', name='input_day')
+            input_hour = Input(shape=(144,), dtype='int32', name='input_hour')
+            input_category = Input(shape=(144,), dtype='int32', name='input_category')
+            input_lat_lon = Input(shape=(144, 40), name='input_lat_lon')
+            
+            # Create embeddings like MARC
+            emb_day = Embedding(input_dim=7, output_dim=32, input_length=144)(input_day)
+            emb_hour = Embedding(input_dim=24, output_dim=32, input_length=144)(input_hour)
+            emb_category = Embedding(input_dim=10, output_dim=32, input_length=144)(input_category)
+            
+            # Process lat_lon
+            lat_lon_dense = Dense(32, activation='relu')(input_lat_lon)
+            
+            # Concatenate all embeddings
+            concat = Concatenate(axis=2)([emb_day, emb_hour, emb_category, lat_lon_dense])
+            
+            # LSTM layer for sequence processing
+            lstm_out = LSTM(64, return_sequences=False)(concat)
+            
+            # Dense layers
+            dense1 = Dense(128, activation='relu')(lstm_out)
+            
+            # Output layer - assuming 100 users for classification
+            # (We'll adjust this if needed based on the actual dataset)
+            output = Dense(193, activation='softmax')(dense1)
+            
+            # Create model
+            fallback_model = Model(
+                inputs=[input_day, input_hour, input_category, input_lat_lon],
+                outputs=output
             )
             
-            # Step 3: Estimate values
-            critic_inputs = real_trajs
-            values = self.critic_model.predict(critic_inputs).flatten()
+            fallback_model.compile(
+                loss='sparse_categorical_crossentropy',
+                optimizer=Adam(0.001),
+                metrics=['accuracy']
+            )
             
-            # Step 4: Calculate advantages
-            advantages = rewards - values
+            print("Created fallback TUL classifier model with matching input format")
             
-            # Normalize advantages
-            normalized_advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
-            
-            # Convert to tensors
-            advantages_tensor = tf.constant(normalized_advantages, dtype=tf.float32)
-            rewards_tensor = tf.constant(rewards, dtype=tf.float32)
-            old_log_probs_tensor = tf.constant(old_log_probs, dtype=tf.float32)
-            
-            # Step 5: PPO update loop
-            actor_losses = []
-            critic_losses = []
-            kl_divs = []
-            
-            for _ in range(ppo_epochs):
-                # Update critic (value function)
-                with tf.GradientTape() as critic_tape:
-                    current_values = self.critic_model(critic_inputs)
-                    current_values = tf.reshape(current_values, [-1])
-                    
-                    # Calculate value loss
-                    value_loss = tf.reduce_mean(tf.square(rewards_tensor - current_values))
-                    
-                # Get critic gradients
-                critic_grads = critic_tape.gradient(value_loss, self.critic_model.trainable_variables)
-                
-                # Apply critic gradients
-                self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic_model.trainable_variables))
-                
-                # Update actor (policy)
-                with tf.GradientTape() as actor_tape:
-                    # Get current policy outputs
-                    current_actor_outputs = self.actor_model(actor_inputs)
-                    
-                    # Calculate log probabilities under current policy
-                    current_log_probs = self.compute_log_probs(actions, current_actor_outputs)
-                    
-                    # Calculate ratio between old and new policy
-                    ratio = tf.exp(current_log_probs - old_log_probs_tensor)
-                    
-                    # Clipped surrogate objective
-                    clip_1 = ratio * advantages_tensor
-                    clip_2 = tf.clip_by_value(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages_tensor
-                    
-                    # Surrogate loss (negative for gradient ascent)
-                    surrogate_loss = -tf.reduce_mean(tf.minimum(clip_1, clip_2))
-                    
-                    # Add entropy bonus for exploration
-                    entropy = tf.reduce_mean(self.compute_entropy(current_actor_outputs))
-                    actor_loss = surrogate_loss - self.entropy_coeff * entropy
-                    
-                # Calculate actor gradients
-                actor_grads = actor_tape.gradient(actor_loss, self.actor_model.trainable_variables)
-                
-                # Apply actor gradients
-                self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor_model.trainable_variables))
-                
-                # Approximate KL divergence for early stopping
-                # KL div = mean(log(old_policy) - log(new_policy))
-                approx_kl = tf.reduce_mean(old_log_probs_tensor - current_log_probs)
-                
-                # Store metrics
-                actor_losses.append(actor_loss.numpy())
-                critic_losses.append(value_loss.numpy())
-                kl_divs.append(approx_kl.numpy())
-                
-                # Early stopping based on KL divergence
-                if approx_kl > target_kl:
-                    break
-            
-            # Return metrics for monitoring
-            metrics = {
-                'actor_loss': np.mean(actor_losses),
-                'critic_loss': np.mean(critic_losses),
-                'kl_div': np.mean(kl_divs),
-                'entropy': entropy.numpy(),
-                'privacy_reward': np.mean(privacy_rewards),
-                'utility_reward': np.mean(utility_rewards),
-                'adv_reward': np.mean(adv_rewards),
-                'total_reward': np.mean(rewards)
-            }
-            
-            return metrics
-    
-    def train_discriminator(self, real_trajs, gen_trajs):
-        """Train the discriminator on real and generated trajectories."""
-        batch_size = len(real_trajs[0])
-        
-        # Unpack trajectories
-        real_latlon, real_day, real_hour, real_category, _ = real_trajs
-        gen_latlon, gen_day, gen_hour, gen_category, _ = gen_trajs
-        
-        # Create labels
-        real_labels = np.ones((batch_size, 1))
-        fake_labels = np.zeros((batch_size, 1))
-        
-        # Train on real trajectories
-        d_loss_real = self.discriminator.train_on_batch(
-            [real_latlon, real_day, real_hour, real_category],
-            real_labels
-        )
-        
-        # Train on generated trajectories
-        d_loss_fake = self.discriminator.train_on_batch(
-            [gen_latlon, gen_day, gen_hour, gen_category],
-            fake_labels
-        )
-        
-        # Average loss
-        d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
-        
-        return {'discriminator_loss': d_loss[0], 'discriminator_acc': d_loss[1]}
-    
-    def train_epoch(self, X_train, batch_size, ppo_epochs=4):
-        """Train for one complete epoch."""
-        # Select random batch of trajectories
-        idx = np.random.randint(0, X_train[0].shape[0], batch_size)
-        user_ids = np.arange(batch_size) % 193  # Ensure valid user IDs
-        
-        # Prepare real trajectories
-        real_trajs = [X_train[0][idx],  # latlon
-                     X_train[1][idx],   # day
-                     X_train[2][idx],   # hour
-                     X_train[3][idx],   # category
-                     X_train[4][idx]]   # mask
-        
-        # Train using PPO
-        ppo_metrics = self.train_ppo(real_trajs, user_ids, ppo_epochs)
-        
-        # Generate trajectories for discriminator training
-        noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
-        actor_inputs = real_trajs + [noise]
-        actor_outputs = self.actor_model.predict(actor_inputs)
-        gen_trajs = self.sample_actions(actor_outputs, deterministic=True)
-        
-        # Train discriminator
-        disc_metrics = self.train_discriminator(real_trajs, gen_trajs)
-        
-        # Combine metrics
-        metrics = {**ppo_metrics, **disc_metrics}
-        
-        return metrics
-    
-    def evaluate_model(self, X_val, user_ids):
-        """Evaluate model performance on validation set."""
-        batch_size = len(X_val[0])
-        
-        # Prepare validation trajectories
-        val_trajs = [X_val[0],    # latlon
-                    X_val[1],     # day
-                    X_val[2],     # hour
-                    X_val[3],     # category
-                    X_val[4]]     # mask
-        
-        # Generate noise
-        noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
-        
-        # Generate trajectories
-        actor_inputs = val_trajs + [noise]
-        actor_outputs = self.actor_model.predict(actor_inputs)
-        gen_trajs = self.sample_actions(actor_outputs, deterministic=True)
-        
-        # Evaluate privacy (using TUL model)
-        tul_inputs = [gen_trajs[0], gen_trajs[1], gen_trajs[2], gen_trajs[3]]
-        tul_outputs = self.tul_model.predict(tul_inputs)
-        pred_users = np.argmax(tul_outputs, axis=1)
-        
-        # Calculate top-1 accuracy (lower is better for privacy)
-        acc_at_1 = np.mean(pred_users == user_ids)
-        
-        # Calculate utility metrics (spatial distance)
-        spatial_distances = []
-        for i in range(batch_size):
-            mask = val_trajs[4][i].reshape(-1) > 0
-            if np.sum(mask) > 0:
-                real_latlon = val_trajs[0][i][mask]
-                gen_latlon = gen_trajs[0][i][mask]
-                
-                # Calculate average distance
-                dist = np.mean(np.sqrt(np.sum((real_latlon - gen_latlon) ** 2, axis=1)))
-                spatial_distances.append(dist)
-        
-        avg_spatial_dist = np.mean(spatial_distances)
-        
-        # Calculate adversarial score (discriminator output)
-        disc_output = self.discriminator.predict(tul_inputs)
-        avg_disc_output = np.mean(disc_output)
-        
-        # Return metrics
-        return {
-            'privacy_acc@1': acc_at_1,
-            'utility_spatial_dist': avg_spatial_dist,
-            'adv_score': avg_disc_output
-        }
-    
-    def save_models(self, path):
-        """Save all model weights to disk."""
-        os.makedirs(path, exist_ok=True)
-        
-        self.actor_model.save_weights(f"{path}/actor_model.weights.h5")
-        self.critic_model.save_weights(f"{path}/critic_model.weights.h5")
-        self.discriminator.save_weights(f"{path}/discriminator_model.weights.h5")
-        self.tul_model.save_weights(f"{path}/tul_model.weights.h5")
-        
-        print(f"Models saved to {path}")
-    
-    def load_models(self, path):
-        """Load all model weights from disk."""
-        self.actor_model.load_weights(f"{path}/actor_model.weights.h5")
-        self.critic_model.load_weights(f"{path}/critic_model.weights.h5")
-        self.discriminator.load_weights(f"{path}/discriminator_model.weights.h5")
-        self.tul_model.load_weights(f"{path}/tul_model.weights.h5")
-        
-        print(f"Models loaded from {path}")
-        
-    def generate_trajectories(self, conditions, num_samples=1, deterministic=False):
-        """Generate trajectories based on provided conditions."""
-        # Prepare inputs
-        if isinstance(conditions, list):
-            # If conditions are provided as a list of trajectories
-            inputs = conditions
-        else:
-            # If conditions are provided as a single trajectory
-            inputs = [np.repeat(conditions[0], num_samples, axis=0),
-                     np.repeat(conditions[1], num_samples, axis=0),
-                     np.repeat(conditions[2], num_samples, axis=0),
-                     np.repeat(conditions[3], num_samples, axis=0),
-                     np.repeat(conditions[4], num_samples, axis=0)]
-        
-        # Generate noise
-        noise = np.random.normal(0, 1, (inputs[0].shape[0], self.latent_dim))
-        
-        # Generate trajectories
-        actor_inputs = inputs + [noise]
-        actor_outputs = self.actor_model.predict(actor_inputs)
-        gen_trajs = self.sample_actions(actor_outputs, deterministic=deterministic)
-        
-        return gen_trajs
-    
-    def _compute_js_divergence(self, real_dist, gen_dist):
-        """Compute Jensen-Shannon divergence between distributions."""
-        # Average distributions across timesteps
-        real_avg = np.mean(real_dist, axis=0)
-        gen_avg = np.mean(gen_dist, axis=0)
-        
-        # Normalize distributions
-        real_norm = real_avg / (np.sum(real_avg) + 1e-10)
-        gen_norm = gen_avg / (np.sum(gen_avg) + 1e-10)
-        
-        # Compute JS divergence
-        m = 0.5 * (real_norm + gen_norm)
-        js_div = 0.5 * (
-            np.sum(real_norm * np.log((real_norm + 1e-10) / (m + 1e-10))) +
-            np.sum(gen_norm * np.log((gen_norm + 1e-10) / (m + 1e-10)))
-        )
-        
-        return js_div
+            # Since the fallback model uses Keras functional API, it already supports __call__
+            return fallback_model
