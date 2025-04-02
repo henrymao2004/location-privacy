@@ -10,16 +10,15 @@ import json
 random.seed(2020)
 np.random.seed(2020)
 tf.random.set_seed(2020)
-
 from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, MultiHeadAttention, LayerNormalization, Dropout
-from keras.initializers import he_uniform
-from keras.regularizers import l1
+from keras.initializers import he_uniform, glorot_uniform
+from keras.regularizers import l1, l2
 
 from keras.models import Sequential, Model
 from keras.optimizers import Adam
 from keras.preprocessing.sequence import pad_sequences
 
-from losses import d_bce_loss, trajLoss, TrajLossLayer, CustomTrajLoss, compute_advantage, compute_returns, compute_trajectory_ratio, compute_entropy_loss
+from losses import CustomTrajLoss
 
 class TransformerBlock(layers.Layer):
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
@@ -59,7 +58,161 @@ class TransformerBlock(layers.Layer):
         })
         return config
 
-class RL_Enhanced_Transformer_TrajGAN():
+class KANLayer(layers.Layer):
+    """Simplified implementation of a Kolmogorov-Arnold Network (KAN) layer."""
+    def __init__(self, 
+                 output_dim, 
+                 grid_size=6,  # Using smaller grid by default
+                 num_components=3,  # Using fewer components by default 
+                 spline_order=1,  # Using linear splines (1) for simplicity
+                 activation='tanh', 
+                 reg_strength=0.0001,
+                 **kwargs):
+        super(KANLayer, self).__init__(**kwargs)
+        self.output_dim = output_dim
+        self.grid_size = grid_size
+        self.num_components = num_components
+        self.spline_order = spline_order
+        self.activation = activation
+        self.reg_strength = reg_strength
+        
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+        
+        # Simplified approach with fewer weights for stability
+        # Projection matrices (one per component)
+        self.projections = []
+        for i in range(self.num_components):
+            self.projections.append(
+                self.add_weight(
+                    shape=(input_dim, 1),
+                    initializer=glorot_uniform(),
+                    regularizer=l2(self.reg_strength),
+                    trainable=True,
+                    dtype=tf.float32,
+                    name=f'projection_{i}'
+                )
+            )
+        
+        # Control points for linear interpolation
+        self.control_points = []
+        for i in range(self.num_components):
+            self.control_points.append(
+                self.add_weight(
+                    shape=(self.grid_size, self.output_dim),
+                    initializer=glorot_uniform(),
+                    regularizer=l2(self.reg_strength),
+                    trainable=True,
+                    dtype=tf.float32,
+                    name=f'control_points_{i}'
+                )
+            )
+            
+        # Component weights for combining outputs
+        self.component_weights = self.add_weight(
+            shape=(self.num_components,),
+            initializer='ones',
+            regularizer=l2(self.reg_strength),
+            trainable=True,
+            dtype=tf.float32,
+            name='component_weights'
+        )
+        
+        # Fixed grid for interpolation
+        self.grid = tf.linspace(-1.0, 1.0, self.grid_size)
+        
+        self.built = True
+    
+    def compute_output_shape(self, input_shape):
+        """Compute output shape."""
+        return (input_shape[0], input_shape[1], self.output_dim)
+    
+    def call(self, inputs):
+        """Apply the simplified KAN transformation."""
+        # Cast inputs to float32 for consistency
+        inputs = tf.cast(inputs, tf.float32)
+        
+        # Extract dimensions
+        batch_size = tf.shape(inputs)[0]
+        seq_length = tf.shape(inputs)[1]
+        
+        # Reshape inputs to 2D for easier processing
+        flat_inputs = tf.reshape(inputs, [-1, inputs.shape[-1]])  # [batch*seq, input_dim]
+        
+        # Process each component separately and collect results
+        component_outputs = []
+        
+        for i in range(self.num_components):
+            # Project input to scalar value in range [-1, 1]
+            projection = tf.matmul(flat_inputs, self.projections[i])  # [batch*seq, 1]
+            projection = tf.clip_by_value(projection, -0.99, 0.99)  # Avoid exact boundary values
+            
+            # Convert to index in grid
+            grid_idx = tf.cast((projection + 1.0) * 0.5 * (self.grid_size - 1), tf.int32)
+            grid_idx = tf.clip_by_value(grid_idx, 0, self.grid_size - 2)  # Ensure valid indexing
+            
+            # Get adjacent control points for interpolation
+            idx = tf.reshape(grid_idx, [-1])  # Flatten for gathering
+            next_idx = idx + 1
+            
+            # Gather control points for each position
+            points = self.control_points[i]  # [grid_size, output_dim]
+            p0 = tf.gather(points, idx)  # [batch*seq, output_dim]
+            p1 = tf.gather(points, next_idx)  # [batch*seq, output_dim]
+            
+            # Calculate interpolation weights
+            projection_flat = tf.reshape(projection, [-1])  # Flatten
+            grid_start = tf.gather(self.grid, idx)
+            grid_end = tf.gather(self.grid, next_idx)
+            t = (projection_flat - grid_start) / tf.maximum(grid_end - grid_start, 1e-6)
+            t = tf.expand_dims(t, -1)  # Add dimension for broadcasting
+            
+            # Linear interpolation
+            component_output = p0 + t * (p1 - p0)  # [batch*seq, output_dim]
+            component_outputs.append(component_output)
+        
+        # Stack and weight components
+        stacked = tf.stack(component_outputs, axis=1)  # [batch*seq, num_components, output_dim]
+        
+        # Apply component weights and sum
+        weights = tf.reshape(self.component_weights, [1, -1, 1])  # [1, num_components, 1]
+        weighted = stacked * weights  # [batch*seq, num_components, output_dim]
+        
+        # Sum across components
+        summed = tf.reduce_sum(weighted, axis=1)  # [batch*seq, output_dim]
+        
+        # Apply activation
+        if self.activation == 'tanh':
+            activated = tf.tanh(summed)
+        elif self.activation == 'sigmoid':
+            activated = tf.sigmoid(summed)
+        elif self.activation == 'relu':
+            activated = tf.nn.relu(summed)
+        elif self.activation == 'softmax':
+            activated = tf.nn.softmax(summed, axis=-1)
+        else:
+            activated = summed
+            
+        # Reshape back to 3D
+        output = tf.reshape(activated, [batch_size, seq_length, self.output_dim])
+        
+        return output
+    
+    def get_config(self):
+        config = super(KANLayer, self).get_config()
+        config.update({
+            'output_dim': self.output_dim,
+            'grid_size': self.grid_size,
+            'num_components': self.num_components,
+            'spline_order': self.spline_order,
+            'activation': self.activation,
+            'reg_strength': self.reg_strength
+        })
+        return config
+
+class KAN_TrajGAN():
+    """Trajectory Generator GAN using Kolmogorov-Arnold Networks."""
+    
     def __init__(self, latent_dim, keys, vocab_size, max_length, lat_centroid, lon_centroid, scale_factor):
         self.latent_dim = latent_dim
         self.max_length = max_length
@@ -73,44 +226,25 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         self.x_train = None
         
-        # RL parameters
-        self.gamma = 0.99  # discount factor
-        self.gae_lambda = 0.95  # GAE parameter
-        self.clip_epsilon = 0.2  # PPO clip parameter
-        self.c1 = 0.5  # value function coefficient (reduced)
-        self.c2 = 0.01  # entropy coefficient
-        self.ppo_epochs = 4  # Number of PPO epochs per batch
+        # Define optimizers with appropriate learning rates and gradient clipping
+        self.generator_optimizer = Adam(0.0001, clipnorm=1.0)
+        self.discriminator_optimizer = Adam(0.00005, clipnorm=1.0)
         
-        # Load or initialize TUL classifier for privacy rewards
-        self.tul_classifier = self.load_tul_classifier()
-        
-        # Define reward weights
-        self.w_adv = 0.5  # Weight for adversarial reward (reduced)
-        self.w_util = 0.5  # Weight for utility reward (reduced)
-        self.w_priv = 0.5  # Weight for privacy reward (reduced)
-        
-        # Define utility component weights
-        self.beta = 0.5   # Spatial loss weight (reduced)
-        self.gamma = 0.2  # Temporal loss weight (reduced)
-        self.chi = 0.2    # Category loss weight (reduced)
-        self.alpha = 0.5  # Privacy strength weight (reduced)
-        
-        # Define optimizers with reduced learning rates and gradient clipping
-        self.actor_optimizer = Adam(0.00001, clipnorm=1.0)  # Reduced from 0.00005
-        self.critic_optimizer = Adam(0.00001, clipnorm=1.0)  # Reduced from 0.00005
-        self.discriminator_optimizer = Adam(0.000005, clipnorm=1.0)  # Reduced from 0.00001
-
         # Build networks
         self.generator = self.build_generator()
-        self.critic = self.build_critic()
         self.discriminator = self.build_discriminator()
         
         # Compile models
-        self.discriminator.compile(loss='binary_crossentropy', optimizer=self.discriminator_optimizer)
-        self.critic.compile(loss='mse', optimizer=self.critic_optimizer)
+        self.discriminator.compile(
+            loss='binary_crossentropy',
+            optimizer=self.discriminator_optimizer
+        )
         
         # Combined model for training
         self.setup_combined_model()
+        
+        # For compatibility with the test script
+        self.discriminator_output_keys = self.keys[:4]  # lat_lon, day, hour, category
 
     def get_config(self):
         """Return the configuration of the model for serialization."""
@@ -121,12 +255,7 @@ class RL_Enhanced_Transformer_TrajGAN():
             "max_length": self.max_length,
             "lat_centroid": self.lat_centroid,
             "lon_centroid": self.lon_centroid,
-            "scale_factor": self.scale_factor,
-            "gamma": self.gamma,
-            "gae_lambda": self.gae_lambda,
-            "clip_epsilon": self.clip_epsilon,
-            "c1": self.c1,
-            "c2": self.c2,
+            "scale_factor": self.scale_factor
         }
         
     @classmethod
@@ -156,7 +285,6 @@ class RL_Enhanced_Transformer_TrajGAN():
             # Try to load saved weights
             model.generator.load_weights(f'{checkpoint_dir}/generator_{epoch}.weights.h5')
             model.discriminator.load_weights(f'{checkpoint_dir}/discriminator_{epoch}.weights.h5')
-            model.critic.load_weights(f'{checkpoint_dir}/critic_{epoch}.weights.h5')
             
             print(f"Successfully loaded model from epoch {epoch}")
             return model
@@ -164,654 +292,569 @@ class RL_Enhanced_Transformer_TrajGAN():
         except Exception as e:
             print(f"Error loading model from checkpoint: {e}")
             raise
+    
+    def _create_kan_block(self, inputs, hidden_dim, output_dim, activation):
+        """Create a KAN block with enhanced spatial and categorical modeling."""
+        # First layer with higher grid resolution for better spatial representation
+        x = KANLayer(
+            hidden_dim, 
+            grid_size=8,  # Increased grid size for better spatial resolution
+            num_components=4,  # More components for better categorical representation
+            activation='relu'
+        )(inputs)
+        
+        # Layer normalization for stability
+        x = LayerNormalization(epsilon=1e-5)(x)
+        
+        # Second KAN layer
+        x = KANLayer(
+            output_dim, 
+            grid_size=8,
+            num_components=4,
+            activation=activation
+        )(x)
+        
+        # Residual connection if input and output dimensions match
+        if inputs.shape[-1] == output_dim:
+            x = Add()([x, inputs])
+            
+        return x
 
     def build_generator(self):
-        # Input Layer
-        inputs = []
-        embeddings = []
+        """Build KAN-based generator with enhanced spatial and categorical branches."""
+        # Input for latent vector
+        z = Input(shape=(self.latent_dim,), name='input_latent', dtype=tf.float32)
         
-        # Noise input
-        noise = Input(shape=(self.latent_dim,), name='input_noise')
-        mask = Input(shape=(self.max_length, 1), name='input_mask')
+        # Expand latent vector to sequence
+        z_repeated = Lambda(lambda x: tf.tile(tf.expand_dims(x, 1), [1, self.max_length, 1]))(z)
         
-        # Embedding layers for each feature
-        for idx, key in enumerate(self.keys):
-            if key == 'mask':
-                inputs.append(mask)
-                continue
-            elif key == 'lat_lon':
-                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
-                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
-                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_latlon = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
-            else:
-                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
-                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
-                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_attr = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
-            inputs.append(i)
-            embeddings.append(e)
+        # Projection to higher dimension
+        x = Dense(128, activation='relu', kernel_initializer='glorot_uniform', dtype=tf.float32)(z_repeated)
         
-        # Add noise input to the inputs list
-        inputs.append(noise)
+        # Apply KAN blocks - use deeper architecture for better spatial modeling
+        x = self._create_kan_block(x, 128, 128, 'relu')
+        x = self._create_kan_block(x, 128, 128, 'relu')
+        x = self._create_kan_block(x, 128, 96, 'relu')
         
-        # Add noise embedding
-        noise_repeated = Lambda(lambda x: tf.tile(tf.expand_dims(x, 1), [1, self.max_length, 1]))(noise)
-        embeddings.append(noise_repeated)
-        
-        # Feature Fusion Layer
-        concat_input = Concatenate(axis=2)(embeddings)
-        
-        # Project concatenated embeddings to correct dimension
-        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
-        
-        # Transformer blocks
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
-        
-        # Output layers
+        # Output layers with specialized branches for each attribute
         outputs = []
         for idx, key in enumerate(self.keys):
             if key == 'mask':
-                output_mask = Lambda(lambda x: x)(mask)
+                # For mask, generate a placeholder
+                output_mask = Lambda(lambda x: tf.ones_like(x[:,:,:1], dtype=tf.float32))(x)
                 outputs.append(output_mask)
             elif key == 'lat_lon':
-                output = TimeDistributed(Dense(2, activation='tanh'), name='output_latlon')(x)
-                scale_factor = self.scale_factor
-                output_stratched = Lambda(lambda x: x * scale_factor)(output)
-                outputs.append(output_stratched)
+                # Greatly enhanced spatial coordinates branch with deeper network
+                # Create a dedicated spatial feature extraction subnet
+                lat_lon_branch = Dense(128, activation='relu', dtype=tf.float32)(x)
+                lat_lon_branch = Dense(96, activation='relu', dtype=tf.float32)(lat_lon_branch)
+                
+                # Add positional encoding to help with sequence ordering
+                position_encoding = self._get_positional_encoding(self.max_length, 96)
+                lat_lon_branch = lat_lon_branch + position_encoding
+                
+                # Add a spatial attention layer to focus on important position features
+                attention_output = MultiHeadAttention(
+                    num_heads=4, key_dim=24, dropout=0.1
+                )(lat_lon_branch, lat_lon_branch)
+                lat_lon_branch = Add()([lat_lon_branch, attention_output])
+                lat_lon_branch = LayerNormalization(epsilon=1e-6)(lat_lon_branch)
+                
+                # Final spatial processing layers
+                lat_lon_branch = Dense(64, activation='relu', dtype=tf.float32)(lat_lon_branch)
+                lat_lon_branch = Dense(32, activation='relu', dtype=tf.float32)(lat_lon_branch)
+                
+                # Special KAN layer for spatial coordinates with higher grid resolution
+                lat_lon_output = KANLayer(
+                    2, 
+                    grid_size=16,  # Higher resolution for spatial data
+                    num_components=8,  # More components for better modeling
+                    activation='tanh'
+                )(lat_lon_branch)
+                
+                # Scale coordinates to proper range
+                scale_factor_param = min(self.scale_factor, 8.0)
+                output_scaled = Lambda(lambda x: x * scale_factor_param, dtype=tf.float32)(lat_lon_output)
+                outputs.append(output_scaled)
+            elif key == 'category':
+                # Enhanced category branch with specialized KAN for categorical data
+                category_branch = Dense(64, activation='relu', dtype=tf.float32)(x)
+                category_branch = Dense(48, activation='relu', dtype=tf.float32)(category_branch)
+                
+                # Use KAN with increased components for better categorical distribution
+                category_output = KANLayer(
+                    self.vocab_size[key], 
+                    grid_size=10,
+                    num_components=5,
+                    activation='softmax',
+                    reg_strength=0.0001  # Reduced regularization for better fitting
+                )(category_branch)
+                outputs.append(category_output)
             else:
-                output = TimeDistributed(Dense(self.vocab_size[key], activation='softmax'), 
-                                       name='output_' + key)(x)
-                outputs.append(output)
+                # Standard branch for temporal features
+                branch = Dense(48, activation='relu', dtype=tf.float32)(x)
+                output_branch = Dense(self.vocab_size[key], activation='softmax', dtype=tf.float32)(branch)
+                outputs.append(output_branch)
         
-        return Model(inputs=inputs, outputs=outputs)
+        return Model(inputs=z, outputs=outputs)
 
-    def build_critic(self):
-        # Input Layer
-        inputs = []
-        embeddings = []
+    def _get_positional_encoding(self, seq_length, d_model):
+        """Create positional encoding tensor for sequence modeling."""
+        # Initialize positional encoding with zeros
+        position_encoding = np.zeros((1, seq_length, d_model), dtype=np.float32)
         
-        for idx, key in enumerate(self.keys):
-            if key == 'mask':
-                continue
-            elif key == 'lat_lon':
-                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
-                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
-                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_latlon = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
-            else:
-                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
-                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
-                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_attr = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
-            inputs.append(i)
-            embeddings.append(e)
+        # Compute position encodings
+        positions = np.arange(seq_length)[:, np.newaxis]
+        div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
         
-        # Feature Fusion Layer
-        concat_input = Concatenate(axis=2)(embeddings)
+        # Apply sine to even indices in the array
+        position_encoding[0, :, 0::2] = np.sin(positions * div_term)
         
-        # Project concatenated embeddings to correct dimension
-        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
+        # Apply cosine to odd indices in the array
+        position_encoding[0, :, 1::2] = np.cos(positions * div_term)
         
-        # Transformer blocks
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
-        
-        # Global average pooling
-        x = tf.keras.layers.GlobalAveragePooling1D()(x)
-        
-        # Value head
-        value = Dense(1)(x)
-        
-        return Model(inputs=inputs, outputs=value)
+        return tf.constant(position_encoding, dtype=tf.float32)
 
     def build_discriminator(self):
-        # Similar to original discriminator but with Transformer blocks
+        """Build discriminator for evaluating trajectories."""
         inputs = []
         embeddings = []
         
+        # Process each feature with separate input branches
         for idx, key in enumerate(self.keys):
             if key == 'mask':
                 continue
-            elif key == 'lat_lon':
-                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
-                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
-                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_latlon = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
             else:
-                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
-                unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
-                         kernel_initializer=he_uniform(seed=1), name='emb_' + key)
-                dense_attr = [d(x) for x in unstacked]
-                e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
-            inputs.append(i)
-            embeddings.append(e)
+                # Input for features
+                i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key, dtype=tf.float32)
+                
+                # Simple Dense layer processing for all features
+                e = Dense(32, activation='relu', dtype=tf.float32)(i)
+                
+                inputs.append(i)
+                embeddings.append(e)
         
-        # Feature Fusion Layer
+        # Concatenate all feature embeddings
         concat_input = Concatenate(axis=2)(embeddings)
         
-        # Project concatenated embeddings to correct dimension
-        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
-        
-        # Transformer blocks
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
+        # Process with Dense layers for stability
+        x = Dense(64, activation='relu', dtype=tf.float32)(concat_input)
         
         # Global average pooling
         x = tf.keras.layers.GlobalAveragePooling1D()(x)
         
-        # Output
-        sigmoid = Dense(1, activation='sigmoid')(x)
+        # Final classification
+        x = Dense(32, activation='relu', dtype=tf.float32)(x)
+        sigmoid = Dense(1, activation='sigmoid', dtype=tf.float32)(x)
         
         return Model(inputs=inputs, outputs=sigmoid)
 
     def setup_combined_model(self):
-        # Generator inputs
-        inputs = []
-        mask = Input(shape=(self.max_length, 1), name='input_mask')
-        noise = Input(shape=(self.latent_dim,), name='input_noise')
-        
-        # Create inputs in the same order as build_generator
-        for idx, key in enumerate(self.keys):
-            if key == 'mask':
-                inputs.append(mask)
-                continue
-            i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
-            inputs.append(i)
-        
-        # Add noise as the last input (to match the generator's input order)
-        inputs.append(noise)
+        """Setup the combined GAN model for adversarial training."""
+        # Latent input
+        z = Input(shape=(self.latent_dim,), name='input_latent', dtype=tf.float32)
         
         # Generate trajectories
-        gen_trajs = self.generator(inputs)
+        gen_trajs = self.generator(z)
         
         # Discriminator predictions
         pred = self.discriminator(gen_trajs[:4])
         
         # Create the combined model
-        self.combined = Model(inputs, pred)
+        self.combined = Model(z, pred)
         
-        # Create a custom loss instance for trajectory optimization
-        self.traj_loss = CustomTrajLoss()
-        # Store input and generator output references
-        self.input_tensors = inputs
-        self.generated_trajectories = gen_trajs
+        # Create a custom loss for trajectory optimization with original weights
+        self.traj_loss = CustomTrajLoss(p_bce=1, p_latlon=10, p_cat=1, p_day=1, p_hour=1)
         
-        # Compile the model with the custom loss
-        self.combined.compile(loss=self.traj_loss, optimizer=self.actor_optimizer)
+        # Stable loss function
+        def stable_bce_loss(y_true, y_pred):
+            # Ensure consistent tensor data types
+            y_true = tf.cast(y_true, tf.float32)
+            y_pred = tf.cast(y_pred, tf.float32)
+            
+            # Clip predictions for numerical stability
+            y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+            
+            # Binary cross entropy
+            bce = -(y_true * tf.math.log(y_pred) + (1 - y_true) * tf.math.log(1 - y_pred))
+            bce = tf.clip_by_value(bce, 0.0, 20.0)
+            
+            return tf.reduce_mean(bce)
         
-        # Store the generator outputs for later use in reward computation
-        self.gen_trajs_symbolic = gen_trajs
-
-    def compute_rewards(self, real_trajs, gen_trajs, tul_classifier):
-        """Compute the three-part reward function as described in the paper.
-        
-        Args:
-            real_trajs: Original real trajectories
-            gen_trajs: Generated synthetic trajectories
-            tul_classifier: Pre-trained TUL classifier for privacy evaluation
-        
-        Returns:
-            Combined reward balancing privacy, utility and realism
-        """
-        # Cast inputs to float32 for consistent typing
-        gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
-        real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
-        
-        # Adversarial reward - measures realism based on discriminator output
-        d_pred = self.discriminator.predict(gen_trajs[:4])
-        d_pred = tf.cast(d_pred, tf.float32)
-        # Clip discriminator predictions to avoid extreme log values
-        d_pred = tf.clip_by_value(d_pred, 1e-7, 1.0 - 1e-7)
-        r_adv = tf.math.log(d_pred)
-        
-        # Utility preservation reward - measures statistical similarity
-        # Spatial loss - L2 distance between coordinates
-        spatial_loss = tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]), axis=[1, 2])
-        spatial_loss = tf.cast(spatial_loss, tf.float32)
-        # Clip spatial loss to avoid extremely large values
-        spatial_loss = tf.clip_by_value(spatial_loss, 0.0, 10.0)
-        
-        # Temporal loss - cross-entropy on temporal distributions (day and hour)
-        # Clip generated values to avoid log(0)
-        gen_trajs_day_clipped = tf.clip_by_value(gen_trajs[2], 1e-7, 1.0 - 1e-7)
-        temp_day_loss = -tf.reduce_sum(real_trajs[2] * tf.math.log(gen_trajs_day_clipped), axis=[1, 2])
-        temp_day_loss = tf.cast(temp_day_loss, tf.float32)
-        temp_day_loss = tf.clip_by_value(temp_day_loss, 0.0, 10.0)
-        
-        gen_trajs_hour_clipped = tf.clip_by_value(gen_trajs[3], 1e-7, 1.0 - 1e-7)
-        temp_hour_loss = -tf.reduce_sum(real_trajs[3] * tf.math.log(gen_trajs_hour_clipped), axis=[1, 2])
-        temp_hour_loss = tf.cast(temp_hour_loss, tf.float32)
-        temp_hour_loss = tf.clip_by_value(temp_hour_loss, 0.0, 10.0)
-        
-        # Categorical loss - cross-entropy on category distributions
-        gen_trajs_cat_clipped = tf.clip_by_value(gen_trajs[1], 1e-7, 1.0 - 1e-7)
-        cat_loss = -tf.reduce_sum(real_trajs[1] * tf.math.log(gen_trajs_cat_clipped), axis=[1, 2])
-        cat_loss = tf.cast(cat_loss, tf.float32)
-        cat_loss = tf.clip_by_value(cat_loss, 0.0, 10.0)
-        
-        # Combine utility components with appropriate weights
-        # Convert Python floats to TensorFlow constants with explicit type
-        beta = tf.constant(1.0, dtype=tf.float32)
-        gamma = tf.constant(0.5, dtype=tf.float32)  # Renamed to avoid clash with class attribute
-        chi = tf.constant(0.5, dtype=tf.float32)
-        
-        r_util = -(beta * spatial_loss + gamma * (temp_day_loss + temp_hour_loss) + chi * cat_loss)
-        
-        # Privacy preservation reward using TUL classifier
-        # Adapt input format for MARC model which expects different dimensions
+        # Compile the combined model
+        self.combined.compile(loss=stable_bce_loss, optimizer=self.generator_optimizer)
+    
+    def train_step(self, real_trajs, batch_size=256):
+        """Perform one step of training for the KAN-GAN."""
         try:
-            batch_size = gen_trajs[0].shape[0]
+            # Sample random noise for the generator
+            z = tf.random.normal([batch_size, self.latent_dim])
             
-            # Format inputs for MARC model:
-            # 1. Convert one-hot to indices for day, hour, category
-            # Note: gen_trajs order is [lat_lon, category, day, hour, mask]
+            # Generate trajectories
+            gen_trajs = self.generator.predict(z, verbose=0)
             
-            # Convert one-hot day to indices (batch_size, 144) where each value is 0-6
-            day_indices = tf.cast(tf.argmax(gen_trajs[2], axis=-1), tf.int32)
-            # Clip day values to ensure they're in the valid range [0, 6]
-            day_indices = tf.clip_by_value(day_indices, 0, 6)
+            # Ensure consistent data types - convert everything to float32
+            real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
+            gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
             
-            # Convert one-hot hour to indices (batch_size, 144) where each value is 0-23
-            hour_indices = tf.cast(tf.argmax(gen_trajs[3], axis=-1), tf.int32)
-            # Clip hour values to ensure they're in the valid range [0, 23]
-            hour_indices = tf.clip_by_value(hour_indices, 0, 23)
+            # Safe conversions with clipping
+            real_trajs = [tf.clip_by_value(tensor, -1e6, 1e6) for tensor in real_trajs]
+            gen_trajs = [tf.clip_by_value(tensor, -1e6, 1e6) for tensor in gen_trajs]
             
-            # Convert one-hot category to indices (batch_size, 144) where each value is 0-9
-            category_indices = tf.cast(tf.argmax(gen_trajs[1], axis=-1), tf.int32)
-            # Clip category values to ensure they're in valid range [0, 9]
-            category_indices = tf.clip_by_value(category_indices, 0, 9)
+            # Update the trajectory loss
+            self.traj_loss.set_trajectories(real_trajs, gen_trajs)
             
-            # Format lat_lon to match MARC's expected input shape (batch_size, 144, 40)
-            # Since our lat_lon is (batch_size, 144, 2), we'll pad it to 40 dimensions
-            lat_lon_padded = tf.pad(gen_trajs[0], [[0, 0], [0, 0], [0, 38]])
+            # Train the discriminator (with label smoothing for stability)
+            # Add stronger label smoothing to combat overfitting
+            real_labels = tf.ones((batch_size, 1), dtype=tf.float32) * 0.85  # Less confident real label
+            fake_labels = tf.zeros((batch_size, 1), dtype=tf.float32) + 0.15  # More positive fake label
             
-            print(f"Input shapes - Day: {day_indices.shape}, Hour: {hour_indices.shape}, " +
-                  f"Category: {category_indices.shape}, Lat_lon: {lat_lon_padded.shape}")
-            print(f"Day range: [{tf.reduce_min(day_indices)}, {tf.reduce_max(day_indices)}]")
+            # Add more significant noise to real data for discriminator training to prevent overfitting
+            noise_factor = 0.1
+            noisy_real = [
+                tensor + tf.random.normal(tf.shape(tensor), mean=0.0, stddev=noise_factor, dtype=tf.float32)
+                for tensor in real_trajs[:4]
+            ]
             
-            # Call the MARC model with the correctly formatted inputs
-            tul_preds = tul_classifier([day_indices, hour_indices, category_indices, lat_lon_padded])
+            # Also add mild noise to fake data for discriminator training
+            noisy_fake = [
+                tensor + tf.random.normal(tf.shape(tensor), mean=0.0, stddev=noise_factor * 0.5, dtype=tf.float32)
+                for tensor in gen_trajs[:4]
+            ]
             
-            # Extract the probability for the correct user
-            # Get the number of output classes from the TUL model
-            num_users = tul_preds.shape[1]
-            print(f"TUL predictions shape: {tul_preds.shape}")
+            # Train discriminator on real data
+            d_loss_real = self.discriminator.train_on_batch(
+                noisy_real,
+                real_labels
+            )
             
-            # Generate user indices but make sure they don't exceed the valid range
-            user_indices = np.arange(batch_size) % num_users
+            # Train discriminator on fake data
+            d_loss_fake = self.discriminator.train_on_batch(
+                noisy_fake,
+                fake_labels
+            )
             
-            # Safely gather user probabilities
-            batch_indices = tf.range(batch_size, dtype=tf.int32)
-            indices = tf.stack([batch_indices, tf.cast(user_indices, tf.int32)], axis=1)
-            user_probs = tf.gather_nd(tul_preds, indices)
+            # Calculate the relative strength of the discriminator
+            disc_strength = (2.0 - (d_loss_real + d_loss_fake))  # Higher value means stronger discriminator
             
-            # Negative reward for correct user identification (penalize high probabilities)
-            alpha = tf.constant(1.0, dtype=tf.float32)  # Privacy weight
-            r_priv = -alpha * tf.cast(user_probs, tf.float32)
+            # Adaptive generator training based on discriminator strength
+            gen_train_steps = 1
+            if disc_strength > 1.0:  # If discriminator is strong (lower loss)
+                gen_train_steps = 2
+            if disc_strength > 1.5:  # If discriminator is very strong
+                gen_train_steps = 3
+                
+            # Train the generator multiple times for better balance
+            g_losses = []
+            # Use softer target for generator to prevent model collapse
+            gen_labels = tf.ones((batch_size, 1), dtype=tf.float32) * 0.85
+            
+            for _ in range(gen_train_steps):
+                # Use fresh noise for each generator training step with slight perturbation
+                z_gen = tf.random.normal([batch_size, self.latent_dim]) + tf.random.normal([batch_size, self.latent_dim], stddev=0.1)
+                g_loss = self.combined.train_on_batch(
+                    z_gen,
+                    gen_labels
+                )
+                if not np.isnan(g_loss) and not np.isinf(g_loss):
+                    g_losses.append(g_loss)
+            
+            g_loss = np.mean(g_losses) if g_losses else 1.0
+            
+            # Calculate utility metrics
+            utility_metrics = self.compute_utility_metrics(real_trajs, gen_trajs)
+            
+            return {
+                "d_loss_real": float(d_loss_real),
+                "d_loss_fake": float(d_loss_fake),
+                "g_loss": float(g_loss),
+                "disc_strength": float(disc_strength),
+                "utility_metrics": utility_metrics
+            }
             
         except Exception as e:
-            print(f"Error computing privacy reward: {e}")
+            print(f"Error in train_step: {e}")
             import traceback
             traceback.print_exc()
-            print("Using a placeholder privacy reward instead")
-            # If there's an error with the TUL model, use a placeholder privacy reward
-            r_priv = tf.zeros_like(r_adv)
+            return {
+                "d_loss_real": 1.0,
+                "d_loss_fake": 1.0,
+                "g_loss": 1.0,
+                "disc_strength": 1.0,
+                "utility_metrics": {
+                    "spatial_loss": 0.0,
+                    "category_loss": 0.0,
+                    "day_loss": 0.0,
+                    "hour_loss": 0.0,
+                    "total_utility": 0.0
+                }
+            }
+    
+    def compute_utility_metrics(self, real_trajs, gen_trajs):
+        """Compute utility metrics with enhanced spatial and categorical emphasis."""
+        try:
+            # Ensure all tensors have the same dtype (float32) before operations
+            real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
+            gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
+            
+            # Enhanced spatial utility (lat-lon) - now with higher weighting
+            spatial_mse = tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]))
+            
+            # Add Haversine distance calculation for geographic accuracy with Earth context
+            EARTH_RADIUS_KM = 6371.0  # Earth's radius in kilometers
+            
+            # Convert to radians for earth distance calculation
+            real_coords = real_trajs[0] * tf.constant(np.pi / 180, dtype=tf.float32)
+            gen_coords = gen_trajs[0] * tf.constant(np.pi / 180, dtype=tf.float32)
+            
+            # Extract lat/lon components
+            real_lat = real_coords[:,:,0]
+            real_lon = real_coords[:,:,1]
+            gen_lat = gen_coords[:,:,0]
+            gen_lon = gen_coords[:,:,1]
+            
+            # Improved haversine formula
+            lat_diff = gen_lat - real_lat
+            lon_diff = gen_lon - real_lon
+            
+            # Haversine formula components
+            a = tf.sin(lat_diff/2)**2 + tf.cos(real_lat) * tf.cos(gen_lat) * tf.sin(lon_diff/2)**2
+            c = 2 * tf.atan2(tf.sqrt(a), tf.sqrt(1-a))
+            geo_distance = EARTH_RADIUS_KM * c
+            
+            # Take the mean across all points
+            spatial_haversine = tf.reduce_mean(geo_distance)
+            
+            # Combine MSE and geographic distance for spatial utility with higher weight on haversine
+            spatial_loss = spatial_mse + tf.constant(0.25, dtype=tf.float32) * spatial_haversine
+            
+            # Add a diversity measure for spatial coordinates
+            # Calculate pairwise distances between generated trajectories
+            batch_size = tf.shape(gen_trajs[0])[0]
+            
+            # Reshape for broadcasting
+            points1 = tf.reshape(gen_coords, [batch_size, -1, 2])  # [batch, seq, 2]
+            points2 = tf.reshape(gen_coords, [batch_size, 1, -1, 2])  # [batch, 1, seq, 2]
+            
+            # Compute pairwise distances within batch along spatial dimension
+            # This creates a tensor of shape [batch, batch, seq]
+            pairwise_diffs = points1[:, tf.newaxis, :, :] - points2
+            pairwise_distances = tf.reduce_mean(tf.sqrt(tf.reduce_sum(pairwise_diffs**2, axis=-1)), axis=-1)
+            
+            # Use the mean of the distances as a diversity score
+            # Exclude self-comparisons (diagonal elements)
+            mask = 1.0 - tf.eye(batch_size)
+            masked_distances = pairwise_distances * tf.cast(mask, tf.float32)
+            spatial_diversity = tf.reduce_sum(masked_distances) / (tf.cast(batch_size, tf.float32) * (tf.cast(batch_size, tf.float32) - 1.0))
+            
+            # Temporal utility (day and hour)
+            temp_day_loss = tf.reduce_mean(tf.reduce_sum(
+                real_trajs[2] * tf.math.log(tf.clip_by_value(gen_trajs[2], 1e-7, 1.0)), 
+                axis=-1))
+            
+            temp_hour_loss = -tf.reduce_mean(tf.reduce_sum(
+                real_trajs[3] * tf.math.log(tf.clip_by_value(gen_trajs[3], 1e-7, 1.0)), 
+                axis=-1))
+            
+            # Enhanced category utility with similarity measure
+            # Use both cross-entropy and JS divergence
+            real_cat = tf.nn.softmax(real_trajs[1])
+            gen_cat = tf.clip_by_value(gen_trajs[1], 1e-7, 1.0)
+            
+            # Cross-entropy component
+            cat_ce = -tf.reduce_mean(tf.reduce_sum(
+                real_cat * tf.math.log(gen_cat), 
+                axis=-1))
+            
+            # Calculate JS divergence approximation
+            m = 0.5 * (real_cat + gen_cat)
+            js_div = 0.5 * (
+                tf.reduce_mean(tf.reduce_sum(real_cat * tf.math.log(tf.clip_by_value(real_cat / (m + 1e-7), 1e-7, 1e8)), axis=-1)) +
+                tf.reduce_mean(tf.reduce_sum(gen_cat * tf.math.log(tf.clip_by_value(gen_cat / (m + 1e-7), 1e-7, 1e8)), axis=-1))
+            )
+            
+            # Calculate category diversity similar to spatial diversity
+            category_diversity = self._compute_category_diversity(gen_cat)
+            
+            # Convert all tensors to numpy before combining
+            spatial_loss_np = float(spatial_loss.numpy())
+            spatial_diversity_np = float(spatial_diversity.numpy())
+            cat_ce_np = float(cat_ce.numpy())
+            js_div_np = float(js_div.numpy())
+            category_diversity_np = float(category_diversity.numpy())
+            temp_day_loss_np = float(temp_day_loss.numpy())
+            temp_hour_loss_np = float(temp_hour_loss.numpy())
+            
+            # Combined category loss with diversity bonus
+            cat_loss = cat_ce_np + 0.5 * js_div_np - 0.5 * category_diversity_np
+            
+            # Calculate individual components for debugging
+            spatial_metric = -spatial_loss_np + spatial_diversity_np
+            day_metric = -temp_day_loss_np
+            hour_metric = -temp_hour_loss_np
+            category_metric = -cat_loss
+            
+            # Combine utility components with adjusted weights to prioritize spatial and category
+            # Include diversity bonuses to combat mode collapse
+            # Increase the weight of spatial component for better spatial utility
+            utility_metric = -(5.0 * spatial_loss_np + 2.5 * cat_loss + 1.0 * temp_day_loss_np + 0.5 * temp_hour_loss_np) + (2.0 * spatial_diversity_np + 1.5 * category_diversity_np)
+            
+            return {
+                "spatial_loss": spatial_loss_np,
+                "spatial_diversity": spatial_diversity_np,
+                "category_loss": cat_loss,
+                "category_diversity": category_diversity_np,
+                "day_loss": temp_day_loss_np,
+                "hour_loss": temp_hour_loss_np,
+                "total_utility": utility_metric
+            }
+            
+        except Exception as e:
+            print(f"Error in utility metrics calculation: {e}")
+            return {
+                "spatial_loss": 0.0,
+                "spatial_diversity": 0.0,
+                "category_loss": 0.0,
+                "category_diversity": 0.0,
+                "day_loss": 0.0,
+                "hour_loss": 0.0,
+                "total_utility": 0.0
+            }
+            
+    def _compute_category_diversity(self, category_probs):
+        """Compute diversity in generated categorical distributions."""
+        batch_size = tf.shape(category_probs)[0]
         
-        # Combined reward with configurable weights
-        w1 = tf.constant(0.5, dtype=tf.float32)  # Reduced weight for adversarial reward
-        w2 = tf.constant(0.3, dtype=tf.float32)  # Reduced weight for utility reward
-        w3 = tf.constant(0.2, dtype=tf.float32)  # Reduced weight for privacy reward
+        # Flatten the category probabilities for each trajectory
+        # This combines all time steps
+        flat_probs = tf.reshape(category_probs, [batch_size, -1])
         
-        r_adv = tf.cast(r_adv, tf.float32)
+        # Compute cosine distance between pairs of trajectories
+        normalized = tf.nn.l2_normalize(flat_probs, axis=1)
+        similarity = tf.matmul(normalized, normalized, transpose_b=True)
         
-        # Ensure r_adv, r_util, and r_priv have appropriate shapes
-        r_adv = tf.reshape(r_adv, [-1])
-        r_util = tf.reshape(r_util, [-1])
-        r_priv = tf.reshape(r_priv, [-1])
+        # Convert similarity to distance (1 - similarity)
+        distance = 1.0 - similarity
         
-        # Compute the combined reward
-        combined_rewards = w1 * r_adv + w2 * r_util + w3 * r_priv
+        # Mask out self-comparisons
+        mask = 1.0 - tf.eye(batch_size)
+        masked_distance = distance * mask
         
-        # Ensure the rewards have shape [batch_size, 1]
-        rewards = tf.reshape(combined_rewards, [batch_size, 1])
+        # Average distance is our diversity measure
+        diversity = tf.reduce_sum(masked_distance) / (tf.cast(batch_size, tf.float32) * (tf.cast(batch_size, tf.float32) - 1.0))
         
-        # Normalize rewards for training stability
-        rewards_mean = tf.reduce_mean(rewards)
-        rewards_std = tf.math.reduce_std(rewards) + 1e-8
-        rewards = (rewards - rewards_mean) / rewards_std
-        
-        # Clip rewards to reasonable range to prevent training instability
-        rewards = tf.clip_by_value(rewards, -5.0, 5.0)
-        
-        # Debug print to check rewards shape and values
-        print(f"Rewards shape: {rewards.shape}, min: {tf.reduce_min(rewards)}, max: {tf.reduce_max(rewards)}, mean: {tf.reduce_mean(rewards)}")
-        
-        return rewards
-
-    def train_step(self, real_trajs, batch_size=256):
-        # Generate trajectories
-        noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
-        gen_trajs = self.generator.predict([*real_trajs, noise])
-        
-        # Ensure consistent data types
-        real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
-        gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
-        
-        # Update the custom loss with the current real and generated trajectories
-        self.traj_loss.set_trajectories(real_trajs, gen_trajs)
-        
-        # Compute full rewards using the TUL classifier
-        rewards = self.compute_rewards(real_trajs, gen_trajs, self.tul_classifier)
-        
-        # Compute advantages and returns for PPO
-        values = self.critic.predict(real_trajs[:4])
-        values = tf.cast(values, tf.float32)
-        advantages = compute_advantage(rewards, values, self.gamma, self.gae_lambda)
-        returns = compute_returns(rewards, self.gamma)
-        
-        # Ensure returns has the same batch size as what the critic expects
-        # The critic takes real_trajs[:4] as input, so returns should match that shape
-        if returns.shape[0] != batch_size:
-            print(f"Warning: Reshaping returns from {returns.shape} to [{batch_size}, 1]")
-            returns = tf.reshape(returns, [batch_size, 1])
-        
-        # Update critic using returns
-        c_loss = self.critic.train_on_batch(real_trajs[:4], returns)
-        
-        # Update discriminator
-        d_loss_real = self.discriminator.train_on_batch(
-            real_trajs[:4],
-            np.ones((batch_size, 1))
-        )
-        d_loss_fake = self.discriminator.train_on_batch(
-            gen_trajs[:4],
-            np.zeros((batch_size, 1))
-        )
-        
-        # Update generator (actor) using advantages
-        g_loss = self.update_actor(real_trajs, gen_trajs, advantages)
-        
-        return {"d_loss_real": d_loss_real, "d_loss_fake": d_loss_fake, "g_loss": g_loss, "c_loss": c_loss}
-
+        return diversity
+    
     def train(self, epochs=200, batch_size=256, sample_interval=10):
-        # Training data
+        """Train the KAN-GAN model."""
+        # Load training data
         x_train = np.load('data/final_train.npy', allow_pickle=True)
         self.x_train = x_train
         
-        # Padding
-        X_train = [pad_sequences(f, self.max_length, padding='pre', dtype='float64') 
-                  for f in x_train]
-        self.X_train = X_train
+        # Padding with consistent dtype
+        X_train = [pad_sequences(f, self.max_length, padding='pre', dtype='float32') for f in x_train[:5]]
         
-        # Check if we need to rebuild the model with correct input shapes
-        needs_rebuild = False
-        actual_shapes = {}
+        # Create results directory
+        os.makedirs('results', exist_ok=True)
         
-        for i, key in enumerate(self.keys):
-            if key != 'mask':
-                actual_shape = X_train[i].shape
-                print(f"Data shape for {key}: {actual_shape}")
-                if key == 'category' and actual_shape[2] != self.vocab_size[key]:
-                    print(f"Mismatch for {key}: expected {self.vocab_size[key]}, got {actual_shape[2]}")
-                    self.vocab_size[key] = actual_shape[2]
-                    needs_rebuild = True
-                actual_shapes[key] = actual_shape[2]
+        # Save initial configuration
+        with open(f'results/model_config_0.json', 'w') as f:
+            json.dump(self.get_config(), f)
         
-        # Rebuild the model if needed
-        if needs_rebuild:
-            print("Rebuilding model with correct input shapes...")
-            # Save optimizer state
-            optimizer_weights = None
-            if hasattr(self, 'actor_optimizer') and hasattr(self.actor_optimizer, 'get_weights'):
-                optimizer_weights = self.actor_optimizer.get_weights()
-            
-            # Rebuild models
-            self.generator = self.build_generator()
-            self.critic = self.build_critic()
-            self.discriminator = self.build_discriminator()
-            
-            # Compile models
-            self.discriminator.compile(loss='binary_crossentropy', optimizer=self.discriminator_optimizer)
-            self.critic.compile(loss='mse', optimizer=self.critic_optimizer)
-            
-            self.setup_combined_model()
-            
-            # Restore optimizer state if available
-            if optimizer_weights is not None:
-                self.actor_optimizer.set_weights(optimizer_weights)
-            
-            print("Model rebuilt successfully!")
-        
-        # Training loop
         print(f"Starting training for {epochs} epochs...")
+        best_utility = float('-inf')
+        best_epoch = 0
+        
         for epoch in range(epochs):
-            # Sample batch
-            idx = np.random.randint(0, len(X_train[0]), batch_size)
-            batch = [X[idx] for X in X_train]
+            # Shuffle and sample batches
+            indices = np.random.permutation(X_train[0].shape[0])
+            num_batches = len(indices) // batch_size
             
-            # Training step
-            metrics = self.train_step(batch, batch_size)
+            epoch_metrics = []
+            for batch in range(num_batches):
+                batch_indices = indices[batch * batch_size:(batch + 1) * batch_size]
+                batch_X = [X[batch_indices] for X in X_train]
+                
+                # Convert batch to float32 for consistent typing
+                batch_X = [tf.cast(X, tf.float32) for X in batch_X]
+                
+                # Train step
+                metrics = self.train_step(batch_X, batch_size)
+                epoch_metrics.append(metrics)
+            
+            # Average metrics across batches
+            avg_metrics = {
+                'd_loss_real': np.mean([m['d_loss_real'] for m in epoch_metrics]),
+                'd_loss_fake': np.mean([m['d_loss_fake'] for m in epoch_metrics]),
+                'g_loss': np.mean([m['g_loss'] for m in epoch_metrics]),
+                'utility': np.mean([m['utility_metrics']['total_utility'] for m in epoch_metrics])
+            }
             
             # Print progress
             if epoch % 10 == 0:
                 print(f"Epoch {epoch}/{epochs}")
-                print(f"D_real: {metrics['d_loss_real']:.4f}, D_fake: {metrics['d_loss_fake']:.4f}, G: {metrics['g_loss']:.4f}, C: {metrics['c_loss']:.4f}")
+                print(f"D_real: {avg_metrics['d_loss_real']:.4f}, D_fake: {avg_metrics['d_loss_fake']:.4f}, G: {avg_metrics['g_loss']:.4f}")
+                print(f"Utility: {avg_metrics['utility']:.4f}")
             
             # Save checkpoints
-            if epoch % sample_interval == 0:
-                self.save_checkpoint(epoch)
-
+            if epoch % sample_interval == 0 or epoch == epochs - 1:
+                self.save_checkpoint(epoch + 1)
+            
+            # Track best model by utility
+            if avg_metrics['utility'] > best_utility:
+                best_utility = avg_metrics['utility']
+                best_epoch = epoch
+                self.save_checkpoint('best')
+                print(f"New best model at epoch {epoch} with utility score: {best_utility:.4f}")
+        
+        print(f"\nTraining completed. Best model found at epoch {best_epoch} with utility score: {best_utility:.4f}")
+    
     def save_checkpoint(self, epoch):
-        # Make sure the results directory exists
+        """Save model checkpoints."""
+        # Make sure results directory exists
         os.makedirs('results', exist_ok=True)
         
-        # Save model weights
-        try:
-            self.generator.save_weights(f'results/generator_{epoch}.weights.h5')
-            self.discriminator.save_weights(f'results/discriminator_{epoch}.weights.h5')
-            self.critic.save_weights(f'results/critic_{epoch}.weights.h5')
-            print(f"Model weights saved for epoch {epoch}")
-        except Exception as e:
-            print(f"Warning: Could not save weights for epoch {epoch}: {e}")
+        # Save configuration
+        config_path = f'results/model_config_{epoch}.json'
+        with open(config_path, 'w') as f:
+            json.dump(self.get_config(), f)
+        print(f"Saved model configuration to {config_path}")
         
-        # Now try to save the full models with architecture
-        try:
-            # Save the Keras models
-            self.generator.save(f'results/generator_architecture_{epoch}.keras')
-            self.discriminator.save(f'results/discriminator_architecture_{epoch}.keras')
-            self.critic.save(f'results/critic_architecture_{epoch}.keras')
-            print(f"Model architectures saved for epoch {epoch}")
-            
-            # Also save the main model's configuration
-            with open(f'results/model_config_{epoch}.json', 'w') as f:
-                json.dump(self.get_config(), f, indent=4)
-            
-        except Exception as e:
-            print(f"Warning: Could not save full model architectures for epoch {epoch}: {e}")
-            print("Only weights were saved. You'll need to recreate the model structure to load them.")
-
-    def update_actor(self, states, actions, advantages):
-        """Update generator using a simplified policy gradient approach."""
-        # Get a single batch of data with random noise for the generator
-        batch_size = states[0].shape[0]
-        noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+        # Save generator weights
+        generator_path = f'results/generator_{epoch}.weights.h5'
+        self.generator.save_weights(generator_path)
+        print(f"Saved generator weights to {generator_path}")
         
-        # Prepare inputs for the generator
-        all_inputs = [*states, noise]
+        # Save discriminator weights
+        discriminator_path = f'results/discriminator_{epoch}.weights.h5'
+        self.discriminator.save_weights(discriminator_path)
+        print(f"Saved discriminator weights to {discriminator_path}")
         
-        # Use ones as targets for the discriminator output (we want to fool the discriminator)
-        targets = np.ones((batch_size, 1))
-        
-        # Convert advantages to numpy and ensure proper type/shape
-        try:
-            # First ensure advantages is a tensor with float32 type
-            advantages = tf.cast(advantages, tf.float32)
-            
-            # Clip advantages to reasonable range before any other operations
-            advantages = tf.clip_by_value(advantages, -10.0, 10.0)
-            
-            # Then convert to numpy and flatten
-            advantages_np = advantages.numpy().flatten()  # Flatten to ensure it's 1D
-            
-            # Scale advantages to be positive (sample_weight should be positive)
-            advantages_np = advantages_np - np.min(advantages_np) + 1e-3
-            
-            # Normalize to reasonable values (0 to 1 range)
-            if np.max(advantages_np) > 0:
-                advantages_np = advantages_np / np.max(advantages_np)
+    def nf_distribution(self):
+        """Provide compatibility with normalizing flow approach."""
+        class DummyDistribution:
+            def __init__(self, latent_dim):
+                self.latent_dim = latent_dim
                 
-            # Ensure it has the right shape
-            if len(advantages_np) != batch_size:
-                print(f"Warning: Reshaping advantages from {len(advantages_np)} to {batch_size}")
-                # If shapes don't match, use uniform weights
-                advantages_np = np.ones(batch_size)
+            def sample(self, n):
+                """Sample from standard normal distribution."""
+                return tf.random.normal([n, self.latent_dim])
                 
-            # Final safety check - replace any NaN or inf values
-            advantages_np = np.nan_to_num(advantages_np, nan=0.5, posinf=1.0, neginf=0.0)
+            def bijector(self):
+                class DummyBijector:
+                    def inverse(self, x):
+                        """Identity function."""
+                        return x
+                return DummyBijector()
                 
-        except Exception as e:
-            print(f"Error processing advantages: {e}")
-            # Fallback to uniform weights
-            advantages_np = np.ones(batch_size)
+            @property
+            def distribution(self):
+                """Return self to mimic the API of the NF distribution."""
+                return self
+                
+            @property
+            def bijector(self):
+                """Return a dummy bijector to mimic the API of the NF distribution."""
+                return self.bijector()
             
-        # Print statistics about advantage values used for training
-        print(f"Advantage stats - min: {np.min(advantages_np):.4f}, max: {np.max(advantages_np):.4f}, " +
-              f"mean: {np.mean(advantages_np):.4f}, std: {np.std(advantages_np):.4f}")
-        
-        # Train the combined model with sample weights from advantages
-        loss = self.combined.train_on_batch(
-            all_inputs, 
-            targets,
-            sample_weight=advantages_np
-        )
-        
-        # If loss is extremely high, clip it for reporting purposes
-        if loss > 10000:  # Arbitrary threshold for "too high" loss
-            print(f"Warning: Loss is very high ({loss:.2f}), consider reducing learning rate manually")
-            loss = min(loss, 10000.0)
-        
-        return loss
-
-    def compute_trajectory_ratio(self, new_predictions, old_predictions):
-        """Compute the PPO policy ratio between new and old policies for trajectory data.
-        
-        For trajectories, we take the product of point-wise prediction ratios,
-        which is equivalent to the ratio of trajectory probabilities under each policy.
-        """
-        # Initialize ratio as ones
-        ratio = tf.ones(shape=(len(new_predictions[0]), 1))
-        
-        # For each categorical output (category, day, hour), compute ratio
-        for i in range(1, 4):  # Categorical outputs
-            # Get probabilities under new policy
-            new_probs = new_predictions[i]
-            
-            # Get probabilities under old policy
-            old_probs = old_predictions[i]
-            
-            # Compute the ratio of probabilities (with small epsilon to avoid division by zero)
-            point_ratio = new_probs / (old_probs + 1e-10)
-            
-            # Reduce along the category dimension to get per-point ratio
-            point_ratio = tf.reduce_sum(point_ratio, axis=-1, keepdims=True)
-            
-            # Multiply with current ratio
-            ratio = ratio * point_ratio
-        
-        # For continuous outputs (coordinates), use normal distribution likelihood ratio
-        # This is simplified - in practice you'd need proper distribution modeling
-        coord_ratio = tf.exp(-0.5 * tf.reduce_sum(tf.square(new_predictions[0] - old_predictions[0]), axis=-1, keepdims=True))
-        ratio = ratio * coord_ratio
-        
-        # Mask out padding
-        mask = new_predictions[4]
-        ratio = ratio * mask
-        
-        # Average over the trajectory length
-        ratio = tf.reduce_mean(ratio, axis=1)
-        
-        return ratio
-
-    def load_tul_classifier(self):
-        """Load the pre-trained Trajectory-User Linking classifier.
-        
-        Returns:
-            A trained model that predicts user IDs from trajectories.
-        """
-        try:
-            # Import MARC class and initialize it
-            from MARC.marc import MARC
-            
-            # Create and initialize the MARC model
-            marc_model = MARC()
-            marc_model.build_model()
-            
-            # Load pre-trained weights
-            marc_model.load_weights('/root/autodl-tmp/location-privacy-main/MARC/MARC_Weight.h5')
-            
-            print("Loaded pre-trained MARC TUL classifier")
-            return marc_model
-            
-        except Exception as e:
-            print(f"Error loading MARC model: {e}")
-            print("Creating a fallback TUL classifier model")
-            
-            # If MARC model loading fails, create a fallback model that matches MARC's input format
-            # MARC expects 4 inputs: day, hour, category (all as indices), and lat_lon (with shape 144,40)
-            
-            # Create input layers with the same names and shapes as MARC
-            input_day = Input(shape=(144,), dtype='int32', name='input_day')
-            input_hour = Input(shape=(144,), dtype='int32', name='input_hour')
-            input_category = Input(shape=(144,), dtype='int32', name='input_category')
-            input_lat_lon = Input(shape=(144, 40), name='input_lat_lon')
-            
-            # Create embeddings like MARC
-            emb_day = Embedding(input_dim=7, output_dim=32, input_length=144)(input_day)
-            emb_hour = Embedding(input_dim=24, output_dim=32, input_length=144)(input_hour)
-            emb_category = Embedding(input_dim=10, output_dim=32, input_length=144)(input_category)
-            
-            # Process lat_lon
-            lat_lon_dense = Dense(32, activation='relu')(input_lat_lon)
-            
-            # Concatenate all embeddings
-            concat = Concatenate(axis=2)([emb_day, emb_hour, emb_category, lat_lon_dense])
-            
-            # LSTM layer for sequence processing
-            lstm_out = LSTM(64, return_sequences=False)(concat)
-            
-            # Dense layers
-            dense1 = Dense(128, activation='relu')(lstm_out)
-            
-            # Output layer - assuming 100 users for classification
-            # (We'll adjust this if needed based on the actual dataset)
-            output = Dense(193, activation='softmax')(dense1)
-            
-            # Create model
-            fallback_model = Model(
-                inputs=[input_day, input_hour, input_category, input_lat_lon],
-                outputs=output
-            )
-            
-            fallback_model.compile(
-                loss='sparse_categorical_crossentropy',
-                optimizer=Adam(0.001),
-                metrics=['accuracy']
-            )
-            
-            print("Created fallback TUL classifier model with matching input format")
-            
-            # Since the fallback model uses Keras functional API, it already supports __call__
-            return fallback_model
+        return DummyDistribution(self.latent_dim)

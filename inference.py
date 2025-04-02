@@ -2,7 +2,7 @@ import sys
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from model import RL_Enhanced_Transformer_TrajGAN
+from model import KAN_TrajGAN
 from keras.preprocessing.sequence import pad_sequences
 import os
 
@@ -52,8 +52,8 @@ if __name__ == '__main__':
     print(f"Geographic stats - Lat centroid: {lat_centroid}, Lon centroid: {lon_centroid}, Scale factor: {scale_factor}")
     
     # Initialize the model
-    print("Initializing RL_Enhanced_Transformer_TrajGAN model...")
-    model = RL_Enhanced_Transformer_TrajGAN(
+    print("Initializing KAN_TrajGAN model...")
+    model = KAN_TrajGAN(
         latent_dim=latent_dim,
         keys=keys,
         vocab_size=vocab_size,
@@ -75,28 +75,12 @@ if __name__ == '__main__':
         else:
             print(f"  Element {i}: type {type(x)}")
     
-    # Prepare test data for the model
-    print("Preparing test data...")
-    # Make sure we have the correct number of elements
-    if len(x_test) >= 7:
-        x_test = [x_test[0], x_test[1], x_test[2], x_test[3], x_test[4], 
-                  x_test[5].reshape(-1, 1) if len(x_test[5].shape) == 1 else x_test[5], 
-                  x_test[6].reshape(-1, 1) if len(x_test[6].shape) == 1 else x_test[6]]
-    else:
-        print("Error: Test data does not have enough elements!")
-        sys.exit(1)
+    # Extract trajectory lengths for post-processing
+    traj_lengths = x_test[6] if len(x_test) > 6 else None
     
-    # Pad the sequences
-    X_test = [pad_sequences(f, max_length, padding='pre', dtype='float64') for f in x_test[:5]]
-    print(f"Padded test data: {len(X_test)} elements")
-    for i, X in enumerate(X_test):
-        print(f"  Element {i}: shape {X.shape}, dtype {X.dtype}")
-    
-    # Add random noise
-    batch_size = X_test[0].shape[0]
+    # Get batch size from test data
+    batch_size = len(x_test[0]) if isinstance(x_test[0], list) else x_test[0].shape[0]
     print(f"Generating synthetic trajectories for {batch_size} samples...")
-    noise = np.random.normal(0, 1, (batch_size, latent_dim))
-    X_test.append(noise)
     
     # Load the generator weights
     print(f"Loading generator weights from {model_path}...")
@@ -107,18 +91,22 @@ if __name__ == '__main__':
         print(f"Error loading generator weights: {e}")
         sys.exit(1)
     
-    # Generate synthetic trajectories
-    print("Generating predictions...")
+    # Generate synthetic trajectories using KAN model
+    print("Generating predictions with KAN model...")
     try:
-        predictions = model.generator.predict(X_test)
+        # Sample from standard normal distribution
+        z = tf.random.normal([batch_size, latent_dim])
+        
+        # Generate trajectories
+        predictions = model.generator.predict(z)
+        
         print(f"Generated {len(predictions)} prediction arrays")
         for i, pred in enumerate(predictions):
             print(f"  Prediction {i}: shape {pred.shape}, dtype {pred.dtype}")
     except Exception as e:
         print(f"Error generating predictions: {e}")
-        print("Input shapes:")
-        for i, X in enumerate(X_test):
-            print(f"  Input {i}: shape {X.shape}, dtype {X.dtype}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     
     # Process the predicted trajectories
@@ -128,11 +116,17 @@ if __name__ == '__main__':
         traj_attr_list = []
         idx = 0
         for row in attributes:
-            if idx < len(x_test[6]):  # Make sure we don't go out of bounds
-                if row.shape == (max_length, 2):
-                    traj_attr_list.append(row[max_length-x_test[6][idx][0]:])
+            if idx < len(traj_lengths):  # Make sure we don't go out of bounds
+                # Get trajectory length (handle both int and array formats)
+                if isinstance(traj_lengths[idx], (list, tuple, np.ndarray)):
+                    traj_len = traj_lengths[idx][0]
                 else:
-                    traj_attr_list.append(np.argmax(row[max_length-x_test[6][idx][0]:], axis=1).reshape(x_test[6][idx][0], 1))
+                    traj_len = traj_lengths[idx]  # Assume it's a simple integer
+                
+                if row.shape == (max_length, 2):
+                    traj_attr_list.append(row[max_length-traj_len:])
+                else:
+                    traj_attr_list.append(np.argmax(row[max_length-traj_len:], axis=1).reshape(traj_len, 1))
                 idx += 1
             else:
                 break
