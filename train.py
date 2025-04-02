@@ -4,7 +4,7 @@ import pandas as pd
 import wandb
 import tensorflow as tf
 from keras.preprocessing.sequence import pad_sequences
-from model import KAN_TrajGAN
+from model import TransformerTrajGAN
 
 def compute_data_stats():
     """Compute statistics from training data."""
@@ -51,9 +51,9 @@ def compute_data_stats():
 def main():
     # Initialize wandb
     wandb.init(
-        project="kan-trajgan",
+        project="transformer-trajgan",
         config={
-            "architecture": "KAN-TrajGAN",
+            "architecture": "Transformer-TrajGAN",
             "dataset": "mobility-trajectories",
             "epochs": 200,
             "batch_size": 256,
@@ -89,7 +89,7 @@ def main():
     scale_factor = data_stats['scale_factor']
     
     # Initialize and train the model
-    model = KAN_TrajGAN(
+    model = TransformerTrajGAN(
         latent_dim=latent_dim,
         keys=keys,
         vocab_size=vocab_size,
@@ -253,9 +253,10 @@ def train_with_monitoring(model, epochs, batch_size, sample_interval):
     print(f"Best diversity model saved as 'best_diversity', Best spatial diversity model saved as 'best_spatial_diversity'")
 
 def extract_utility_metrics(model, batch):
-    """Extract utility metrics from a training batch with emphasis on spatial and category diversity"""
-    # Sample from normal distribution for KAN model
-    z = tf.random.normal([len(batch[0]), model.latent_dim])
+    """Extract utility metrics from the model with a specific batch"""
+    # Sample from normal distribution for Transformer model
+    batch_size = batch[0].shape[0]
+    z = tf.random.normal([batch_size, model.latent_dim])
     
     # Generate trajectories
     gen_trajs = model.generator.predict(z, verbose=0)

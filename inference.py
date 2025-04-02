@@ -2,7 +2,7 @@ import sys
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from model import KAN_TrajGAN
+from model import TransformerTrajGAN
 from keras.preprocessing.sequence import pad_sequences
 import os
 
@@ -52,8 +52,8 @@ if __name__ == '__main__':
     print(f"Geographic stats - Lat centroid: {lat_centroid}, Lon centroid: {lon_centroid}, Scale factor: {scale_factor}")
     
     # Initialize the model
-    print("Initializing KAN_TrajGAN model...")
-    model = KAN_TrajGAN(
+    print("Initializing TransformerTrajGAN model...")
+    model = TransformerTrajGAN(
         latent_dim=latent_dim,
         keys=keys,
         vocab_size=vocab_size,
@@ -91,8 +91,8 @@ if __name__ == '__main__':
         print(f"Error loading generator weights: {e}")
         sys.exit(1)
     
-    # Generate synthetic trajectories using KAN model
-    print("Generating predictions with KAN model...")
+    # Generate synthetic trajectories using Transformer model
+    print("Generating predictions with Transformer model...")
     try:
         # Sample from standard normal distribution
         z = tf.random.normal([batch_size, latent_dim])
